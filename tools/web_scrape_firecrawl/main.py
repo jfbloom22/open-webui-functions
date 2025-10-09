@@ -1,12 +1,12 @@
 """
 title: Firecrawl Web Scrape
-description: Firecrawl web scraping tool that extracts text content using Firecrawl service.
+description: Firecrawl web scraping tool with v2 API support, retry logic, and summary format extraction.
 author: Artur Zdolinski
 author_url: https://github.com/azdolinski
 git_url: https://github.com/azdolinski/open-webui-tools
 required_open_webui_version: 0.4.0
 requirements: requests, urllib3, pydantic, html2text, tiktoken
-version: 0.6.0 [2024-12-04]
+version: 0.7.0 [2025-10-09]
 licence: MIT
 """
 
@@ -62,11 +62,11 @@ class Tools:
     # Define Valves for admin configuration
     class Valves(BaseModel):
         # Mandatory fields
-        firecrawl_api_url: str = "https://api.firecrawl.dev/v1/"
+        firecrawl_api_url: str = "https://api.firecrawl.dev/"
         firecrawl_api_key: str = ""
         formats: List[str] = Field(
             default=["markdown"],
-            description="Output formats for the scraped content: markdown, html, rawHtml, links, screenshot. Extra post processing HTML function -> html2text, html2bs4",
+            description="Output formats for the scraped content: markdown, html, rawHtml, links, screenshot, summary. Extra post processing HTML function -> html2text, html2bs4",
         )
 
         # Optional fields with defaults
@@ -241,13 +241,27 @@ class Tools:
 
     @property
     def session(self):
-        """Get or create a requests session with proper configuration."""
+        """Get or create a requests session with connection pooling and proper configuration."""
         if self._session is None:
             self._session = requests.Session()
+
+            # Configure connection pooling for better performance
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=10,
+                pool_maxsize=20,
+                max_retries=3,
+                pool_block=False
+            )
+            self._session.mount('http://', adapter)
+            self._session.mount('https://', adapter)
+
+            # Configure SSL settings
             if not self.valves.verify_ssl:
                 # Disable SSL verification warnings when verify_ssl is False
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 self._session.verify = False
+
+            # Set default headers
             if self.valves.firecrawl_api_key:
                 self._session.headers.update(
                     {
@@ -256,6 +270,42 @@ class Tools:
                     }
                 )
         return self._session
+
+    async def _make_request_with_retry(self, endpoint: str, payload: dict, max_retries: int = 3) -> requests.Response:
+        """Make HTTP request with exponential backoff retry logic"""
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(
+                    endpoint,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.valves.firecrawl_api_key}"},
+                    verify=self.valves.verify_ssl,
+                    timeout=self.valves.timeout,
+                )
+
+                # Return successful responses or non-retryable errors
+                if response.status_code < 500:
+                    return response
+
+                # For server errors, retry with exponential backoff
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Server error {response.status_code}, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                return response
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Request failed: {e}, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise e
+
+        # This should never be reached, but just in case
+        raise RuntimeError(f"Failed after {max_retries} attempts")
 
     async def web_scrape(
         self, url: str, __user__: dict = None, __event_emitter__=None
@@ -310,16 +360,10 @@ class Tools:
 
             # Make the request
             base_url = self.valves.firecrawl_api_url.rstrip("/")
-            endpoint = f"{base_url}/scrape"
+            endpoint = f"{base_url}/v2/scrape"
             logger.debug(f"Making request to endpoint: {endpoint}")
 
-            response = requests.post(
-                endpoint,
-                json=payload,
-                headers={"Authorization": f"Bearer {self.valves.firecrawl_api_key}"},
-                verify=self.valves.verify_ssl,
-                timeout=self.valves.timeout,
-            )
+            response = await self._make_request_with_retry(endpoint, payload)
             logger.debug(f"Response status code: {response.status_code}")
 
             if response.status_code != 200:
@@ -388,6 +432,12 @@ class Tools:
                     content[format] = data
 
                 # print(f"Tokens for format: " + format + ": " + str(self.num_tokens_from_string(content[format], "cl100k_base")) + "[cl100k_base] / " + str(self.num_tokens_from_string(content[format], "o200k_base")) + "[o200k_base] - content len: "+ str(len(content[format])) + " chars")
+
+            # Process summary format if requested
+            if "summary" in self.valves.formats:
+                summary_data = response_data.get("data", {}).get("summary", "")
+                if summary_data:
+                    content["summary"] = summary_data.strip()
 
             # Lets return content
             formatted_content = json.dumps(content, indent=4, ensure_ascii=False)
