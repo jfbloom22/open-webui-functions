@@ -4,21 +4,23 @@ author: owndev
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.1.1
+version: 2.0.0
 requirements: google-genai
 license: Apache License 2.0
-description: A manifold pipeline for interacting with Google Gemini models, including dynamic model specification, streaming responses, and flexible error handling.
+description: A manifold pipeline for interacting with Google Gemini models following SDK best practices with context managers, streaming responses, and comprehensive error handling.
 features:
-  - Asynchronous API calls for better performance
+  - Follows Google GenAI SDK best practices with context managers
+  - Automatic resource cleanup for sync and async operations
   - Model caching to reduce API calls
   - Dynamic model specification with automatic prefix stripping
   - Streaming response handling with safety checks
   - Support for multimodal input (text and images)
-  - Flexible error handling and logging
-  - Integration with Google Generative AI or Vertex AI API for content generation
+  - Comprehensive error handling and logging
+  - Integration with Google Generative AI or Vertex AI API
   - Support for various generation parameters (temperature, max tokens, etc.)
   - Customizable safety settings based on environment variables
   - Encrypted storage of sensitive API keys
+  - Exponential backoff retry mechanism for transient errors
 """
 
 import os
@@ -169,15 +171,22 @@ class Pipe:
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
 
-    def _get_client(self) -> genai.Client:
+    def _create_client(self) -> genai.Client:
         """
-        Validates API credentials and returns a genai.Client instance.
+        Creates and returns a new genai.Client instance based on configuration.
+        Validates credentials before creating the client.
+        
+        Returns:
+            genai.Client: A new client instance
+            
+        Raises:
+            ValueError: If credentials are not properly configured
         """
         self._validate_api_key()
 
         if self.valves.USE_VERTEX_AI:
             self.log.debug(
-                f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})"
+                f"Creating Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})"
             )
             return genai.Client(
                 vertexai=True,
@@ -185,7 +194,7 @@ class Pipe:
                 location=self.valves.VERTEX_LOCATION,
             )
         else:
-            self.log.debug("Initializing Google Generative AI client with API Key")
+            self.log.debug("Creating Google Generative AI client with API Key")
             return genai.Client(api_key=self.valves.GOOGLE_API_KEY.get_decrypted())
 
     def _validate_api_key(self) -> None:
@@ -214,7 +223,8 @@ class Pipe:
                 )
             self.log.debug("Using Google Generative AI API with API Key.")
 
-    def strip_prefix(self, model_name: str) -> str:
+    @staticmethod
+    def strip_prefix(model_name: str) -> str:
         """
         Extract the model identifier using regex, handling various naming conventions.
         e.g., "google_gemini_pipeline.gemini-2.5-flash-preview-04-17" -> "gemini-2.5-flash-preview-04-17"
@@ -247,36 +257,41 @@ class Pipe:
             return self._model_cache
 
         try:
-            client = self._get_client()
-            self.log.debug("Fetching models from Google API")
-            models = client.models.list()
-            available_models = []
-            for model in models:
-                actions = model.supported_actions
-                if actions is None or "generateContent" in actions:
-                    available_models.append(
-                        {
-                            "id": self.strip_prefix(model.name),
-                            "name": model.display_name or self.strip_prefix(model.name),
-                        }
-                    )
+            # Use context manager for automatic resource cleanup
+            # Following SDK best practices: https://github.com/googleapis/python-genai
+            with self._create_client() as client:
+                self.log.debug("Fetching models from Google API")
+                
+                # Fetch and process models
+                models = list(client.models.list())
+                self.log.debug(f"Retrieved {len(models)} total models from Google API")
+                
+                available_models = []
+                for model in models:
+                    actions = model.supported_actions
+                    if actions is None or "generateContent" in actions:
+                        available_models.append(
+                            {
+                                "id": self.strip_prefix(model.name),
+                                "name": model.display_name or self.strip_prefix(model.name),
+                            }
+                        )
 
-            model_map = {model["id"]: model for model in available_models}
+                # Filter to only include Gemini models
+                model_map = {model["id"]: model for model in available_models}
+                filtered_models = {
+                    k: v for k, v in model_map.items() if k.startswith("gemini-")
+                }
 
-            # Filter map to only include models starting with 'gemini-'
-            filtered_models = {
-                k: v for k, v in model_map.items() if k.startswith("gemini-")
-            }
-
-            # Update cache
-            self._model_cache = list(filtered_models.values())
-            self._model_cache_time = current_time
-            self.log.debug(f"Found {len(self._model_cache)} Gemini models")
-            return self._model_cache
+                # Update cache
+                self._model_cache = list(filtered_models.values())
+                self._model_cache_time = current_time
+                self.log.debug(f"Found {len(self._model_cache)} Gemini models")
+                return self._model_cache
+            # Client is automatically closed here
 
         except Exception as e:
             self.log.exception(f"Could not fetch models from Google: {str(e)}")
-            # Return a specific error entry for the UI
             return [{"id": "error", "name": f"Could not fetch models: {str(e)}"}]
 
     def pipes(self) -> List[Dict[str, str]]:
@@ -480,7 +495,7 @@ class Pipe:
                     category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
                 ),
             ]
-            gen_config_params |= ({"safety_settings": safety_settings},)
+            gen_config_params["safety_settings"] = safety_settings
 
         # Filter out None values for generation config
         filtered_params = {k: v for k, v in gen_config_params.items() if v is not None}
@@ -633,46 +648,48 @@ class Pipe:
             # Configure generation parameters and safety settings
             generation_config = self._configure_generation(body, system_instruction)
 
-            # Make the API call
-            client = self._get_client()
-            if stream:
-                try:
+            # Use async context manager for automatic resource cleanup
+            # Following SDK best practices: https://github.com/googleapis/python-genai
+            async with self._create_client().aio as aclient:
+                if stream:
+                    try:
 
-                    async def get_streaming_response():
-                        return await client.aio.models.generate_content_stream(
-                            model=model_id,
-                            contents=contents,
-                            config=generation_config,
+                        async def get_streaming_response():
+                            return await aclient.models.generate_content_stream(
+                                model=model_id,
+                                contents=contents,
+                                config=generation_config,
+                            )
+
+                        response_iterator = await self._retry_with_backoff(
+                            get_streaming_response
                         )
+                        self.log.debug(f"Request {request_id}: Got streaming response")
+                        return self._handle_streaming_response(response_iterator)
 
-                    response_iterator = await self._retry_with_backoff(
-                        get_streaming_response
-                    )
-                    self.log.debug(f"Request {request_id}: Got streaming response")
-                    return self._handle_streaming_response(response_iterator)
+                    except Exception as e:
+                        self.log.exception(f"Error in streaming request {request_id}: {e}")
+                        return f"Error during streaming: {e}"
+                else:
+                    try:
 
-                except Exception as e:
-                    self.log.exception(f"Error in streaming request {request_id}: {e}")
-                    return f"Error during streaming: {e}"
-            else:
-                try:
+                        async def get_response():
+                            return await aclient.models.generate_content(
+                                model=model_id,
+                                contents=contents,
+                                config=generation_config,
+                            )
 
-                    async def get_response():
-                        return await client.aio.models.generate_content(
-                            model=model_id,
-                            contents=contents,
-                            config=generation_config,
+                        response = await self._retry_with_backoff(get_response)
+                        self.log.debug(f"Request {request_id}: Got non-streaming response")
+                        return self._handle_standard_response(response)
+
+                    except Exception as e:
+                        self.log.exception(
+                            f"Error in non-streaming request {request_id}: {e}"
                         )
-
-                    response = await self._retry_with_backoff(get_response)
-                    self.log.debug(f"Request {request_id}: Got non-streaming response")
-                    return self._handle_standard_response(response)
-
-                except Exception as e:
-                    self.log.exception(
-                        f"Error in non-streaming request {request_id}: {e}"
-                    )
-                    return f"Error generating content: {e}"
+                        return f"Error generating content: {e}"
+                # Client is automatically closed here
 
         except ClientError as ce:
             error_msg = f"Client error raised by the GenAI API: {ce}."
@@ -695,11 +712,7 @@ class Pipe:
             return error_msg
 
         except Exception as e:
-            # Log the full error with traceback
-            import traceback
-
-            error_trace = traceback.format_exc()
-            self.log.exception(f"Unexpected error: {e}\n{error_trace}")
-
+            # Log the full error
+            self.log.exception(f"Unexpected error: {e}")
             # Return a user-friendly error message
             return f"An error occurred while processing your request: {e}"
