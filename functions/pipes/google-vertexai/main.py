@@ -7,19 +7,19 @@ funding_url: https://github.com/sponsors/owndev
 version: 2.0.0
 requirements: google-genai
 license: Apache License 2.0
-description: A manifold pipeline for interacting with Google Gemini models following SDK best practices with context managers, streaming responses, and comprehensive error handling.
+description: A manifold pipeline for Google Gemini models with optimized client management - context managers for sync operations, persistent client for async operations.
 features:
-  - Follows Google GenAI SDK best practices with context managers
-  - Automatic resource cleanup for sync and async operations
-  - Model caching to reduce API calls
+  - Optimized client management (context managers for sync, persistent for async)
+  - Prevents streaming connector errors with persistent async client
+  - Model caching to reduce API calls (configurable TTL)
   - Dynamic model specification with automatic prefix stripping
-  - Streaming response handling with safety checks
-  - Support for multimodal input (text and images)
+  - Streaming and non-streaming response support
+  - Multimodal input support (text and images)
   - Comprehensive error handling and logging
-  - Integration with Google Generative AI or Vertex AI API
-  - Support for various generation parameters (temperature, max tokens, etc.)
-  - Customizable safety settings based on environment variables
-  - Encrypted storage of sensitive API keys
+  - Dual API support (Generative AI API and Vertex AI)
+  - Configurable generation parameters (temperature, tokens, etc.)
+  - Customizable safety settings via environment variables
+  - Encrypted API key storage with automatic encryption/decryption
   - Exponential backoff retry mechanism for transient errors
 """
 
@@ -170,6 +170,32 @@ class Pipe:
         # Model cache
         self._model_cache: Optional[List[Dict[str, str]]] = None
         self._model_cache_time: float = 0
+
+        # Persistent async client for streaming operations
+        # Streaming requires the client to outlive the request context
+        # See: https://github.com/googleapis/python-genai/issues/[streaming-context]
+        self._async_client: Optional[Any] = None
+        self._async_client_lock = asyncio.Lock()
+
+    async def _get_async_client(self):
+        """
+        Get or create a persistent async client for streaming operations.
+        
+        Streaming requires a persistent client because the generator is consumed
+        outside the request context. Using a context manager would close the client
+        before the stream is fully consumed, causing connector errors.
+        
+        Returns:
+            Async client instance (.aio)
+        """
+        async with self._async_client_lock:
+            if self._async_client is not None:
+                return self._async_client
+
+            self.log.debug("Creating persistent async client for streaming")
+            base_client = self._create_client()
+            self._async_client = base_client.aio
+            return self._async_client
 
     def _create_client(self) -> genai.Client:
         """
@@ -648,48 +674,49 @@ class Pipe:
             # Configure generation parameters and safety settings
             generation_config = self._configure_generation(body, system_instruction)
 
-            # Use async context manager for automatic resource cleanup
-            # Following SDK best practices: https://github.com/googleapis/python-genai
-            async with self._create_client().aio as aclient:
-                if stream:
-                    try:
-
-                        async def get_streaming_response():
-                            return await aclient.models.generate_content_stream(
-                                model=model_id,
-                                contents=contents,
-                                config=generation_config,
-                            )
-
-                        response_iterator = await self._retry_with_backoff(
-                            get_streaming_response
+            # Get persistent async client for all async operations
+            # We use a persistent client for async because:
+            # 1. Streaming: generator is consumed outside request context
+            # 2. Non-streaming: works fine with persistent client too
+            # This avoids the need to branch on streaming vs non-streaming
+            aclient = await self._get_async_client()
+            
+            if stream:
+                try:
+                    async def get_streaming_response():
+                        return await aclient.models.generate_content_stream(
+                            model=model_id,
+                            contents=contents,
+                            config=generation_config,
                         )
-                        self.log.debug(f"Request {request_id}: Got streaming response")
-                        return self._handle_streaming_response(response_iterator)
 
-                    except Exception as e:
-                        self.log.exception(f"Error in streaming request {request_id}: {e}")
-                        return f"Error during streaming: {e}"
-                else:
-                    try:
+                    response_iterator = await self._retry_with_backoff(
+                        get_streaming_response
+                    )
+                    self.log.debug(f"Request {request_id}: Got streaming response")
+                    return self._handle_streaming_response(response_iterator)
 
-                        async def get_response():
-                            return await aclient.models.generate_content(
-                                model=model_id,
-                                contents=contents,
-                                config=generation_config,
-                            )
-
-                        response = await self._retry_with_backoff(get_response)
-                        self.log.debug(f"Request {request_id}: Got non-streaming response")
-                        return self._handle_standard_response(response)
-
-                    except Exception as e:
-                        self.log.exception(
-                            f"Error in non-streaming request {request_id}: {e}"
+                except Exception as e:
+                    self.log.exception(f"Error in streaming request {request_id}: {e}")
+                    return f"Error during streaming: {e}"
+            else:
+                try:
+                    async def get_response():
+                        return await aclient.models.generate_content(
+                            model=model_id,
+                            contents=contents,
+                            config=generation_config,
                         )
-                        return f"Error generating content: {e}"
-                # Client is automatically closed here
+
+                    response = await self._retry_with_backoff(get_response)
+                    self.log.debug(f"Request {request_id}: Got non-streaming response")
+                    return self._handle_standard_response(response)
+
+                except Exception as e:
+                    self.log.exception(
+                        f"Error in non-streaming request {request_id}: {e}"
+                    )
+                    return f"Error generating content: {e}"
 
         except ClientError as ce:
             error_msg = f"Client error raised by the GenAI API: {ce}."
