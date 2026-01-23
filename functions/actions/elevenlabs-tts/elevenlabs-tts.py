@@ -3,10 +3,12 @@ title: ElevenLabs TTS Action
 author: justinh-rahb
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 0.1.1
+version: 0.2.0
 license: MIT
 icon_url: data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3QgeD0iOCIgeT0iNiIgd2lkdGg9IjYiIGhlaWdodD0iMjAiIGZpbGw9IiM0QzRDNEMiLz48cmVjdCB4PSIxOCIgeT0iNiIgd2lkdGg9IjYiIGhlaWdodD0iMjAiIGZpbGw9IiM0QzRDNEMiLz48L3N2Zz4=
 required_open_webui_version: 0.3.10
+requirements: aiohttp, pydantic
+description: Convert assistant messages to speech using ElevenLabs TTS with configurable voice selection and default voice support
 """
 
 import aiohttp
@@ -31,6 +33,14 @@ class Action:
         ELEVENLABS_MODEL_ID: str = Field(
             default="eleven_multilingual_v2",
             description="ID of the ElevenLabs TTS model to use.",
+        )
+        DEFAULT_VOICE: str = Field(
+            default="Donovan",
+            description="Default voice to use for text-to-speech generation. Change this to your preferred voice for quick one-click TTS.",
+        )
+        CUSTOM_VOICES: str = Field(
+            default="Donovan:DMyrgzQFny3JI1Y1paM5:Articulate, Strong and Deep\nJessica:g6xIsTj2HwM6VR4iXFCw:Friendly and Conversational\nMark:1SM7GgM6IMuvQlz2BwM3:ConvoAI\nArcher:Fahco4VZzobUeiPqni1S:Conversational\nBrittney:kPzsL2i3teMYv0FxEYQ6:Fun, Youthful and Informal",
+            description="Custom voices in format: VoiceName:VoiceID:Description (one per line). Only these voices will be shown.",
         )
 
     def __init__(self):
@@ -63,20 +73,55 @@ class Action:
 
         voices_url = f"{base_url}/voices"
         try:
+            # First, parse custom voices from Valves
+            custom_voice_map = {}
+            custom_voice_descriptions = {}
+            if self.valves.CUSTOM_VOICES:
+                for line in self.valves.CUSTOM_VOICES.strip().split("\n"):
+                    if ":" in line:
+                        parts = line.split(":", 2)  # Split into max 3 parts
+                        if len(parts) >= 2:
+                            voice_name = parts[0].strip()
+                            voice_id = parts[1].strip()
+                            description = parts[2].strip() if len(parts) > 2 else ""
+                            custom_voice_map[voice_name] = voice_id
+                            if description:
+                                custom_voice_descriptions[voice_name] = description
+            
+            if DEBUG:
+                print(f"Debug: Parsed {len(custom_voice_map)} custom voices")
+                print(f"Debug: Custom voices: {list(custom_voice_map.keys())}")
+            
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                 async with session.get(voices_url, headers=headers) as response:
                     response.raise_for_status()
                     voices_data = await response.json()
 
-                    display_message = f"Select a voice from the {len(voices_data.get('voices', []))} available options:"
+                    # Build voice options dictionary - use ONLY custom voices if configured
                     voice_options = {}
-                    for voice in voices_data.get("voices", []):
-                        voice_name = voice["name"]
-                        voice_id = voice["voice_id"]
-                        voice_options[voice_name] = voice_id
-
+                    if custom_voice_map:
+                        voice_options = custom_voice_map.copy()
+                    else:
+                        # Fallback to API voices if no custom voices
+                        for voice in voices_data.get("voices", []):
+                            voice_name = voice["name"]
+                            voice_id = voice["voice_id"]
+                            base_name = voice_name.split(" - ")[0].strip()
+                            voice_options[base_name] = voice_id
+                    
                     if DEBUG:
-                        print(f"Debug: Found {len(voices_data.get('voices', []))} voices")
+                        print(f"Debug: Using {len(voice_options)} custom voices")
+                        print(f"Debug: Voices: {list(voice_options.keys())}")
+                    
+                    # Build display message with custom voice descriptions
+                    display_message = "**Available Voices** (copy-paste the name):\n\n"
+                    
+                    for voice_name in voice_options.keys():
+                        description = custom_voice_descriptions.get(voice_name, "")
+                        if description:
+                            display_message += f"• **{voice_name}** - {description}\n"
+                        else:
+                            display_message += f"• **{voice_name}**\n"
 
                     return display_message, voice_options
 
@@ -123,19 +168,28 @@ class Action:
             if not __event_call__:
                 raise ValueError("Action requires user interaction but event_call is not available")
 
+            # Use default voice from Valves, or fallback to first available voice
+            default_voice = self.valves.DEFAULT_VOICE
+            
+            # Try case-insensitive match for default voice
+            if default_voice not in self.voice_id_cache:
+                voice_names_lower = {name.lower(): name for name in self.voice_id_cache.keys()}
+                if default_voice.lower() in voice_names_lower:
+                    default_voice = voice_names_lower[default_voice.lower()]
+                else:
+                    # Fallback to first available voice if default not found
+                    default_voice = list(self.voice_id_cache.keys())[0]
+                    if DEBUG:
+                        print(f"Debug: Default voice '{self.valves.DEFAULT_VOICE}' not found. Using '{default_voice}' instead.")
+            
             response = await __event_call__(
                 {
                     "type": "input",
                     "data": {
-                        "title": "Select Voice",
+                        "title": "Select Voice for Text-to-Speech",
                         "message": display_message,
-                        "input_type": "select",
-                        "options": list(self.voice_id_cache.keys()),
-                        "value": (
-                            list(self.voice_id_cache.keys())[0]
-                            if self.voice_id_cache
-                            else None
-                        ),
+                        "placeholder": "Copy-paste a voice name from above",
+                        "value": default_voice,
                     },
                 }
             )
@@ -155,16 +209,31 @@ class Action:
             else:
                 raise ValueError(f"Unexpected response type: {type(response)}")
 
-            # Validate the selected voice exists in our cache
-            selected_voice_id = self.voice_id_cache.get(selected_voice_name)
+            # Validate the selected voice exists in our cache (case-insensitive)
+            selected_voice_id = None
+            
+            # First try exact match
+            if selected_voice_name in self.voice_id_cache:
+                selected_voice_id = self.voice_id_cache[selected_voice_name]
+            else:
+                # Try case-insensitive match
+                voice_name_lower = selected_voice_name.lower()
+                for voice_name, voice_id in self.voice_id_cache.items():
+                    if voice_name.lower() == voice_name_lower:
+                        selected_voice_id = voice_id
+                        selected_voice_name = voice_name  # Use the correct casing
+                        break
 
             if DEBUG:
-                print(
-                    f"Debug: Selected voice: {selected_voice_name} ({selected_voice_id})"
-                )
+                print(f"Debug: Selected voice: {selected_voice_name} ({selected_voice_id})")
+                print(f"Debug: Available voices: {list(self.voice_id_cache.keys())[:10]}")
 
             if not selected_voice_id:
-                raise ValueError(f"Invalid voice selection: '{selected_voice_name}' not found in available voices")
+                available_voices = ", ".join(list(self.voice_id_cache.keys())[:10])
+                raise ValueError(
+                    f"Invalid voice selection: '{selected_voice_name}' not found. "
+                    f"Available voices include: {available_voices}"
+                )
 
             messages = body.get("messages", [])
             assistant_message = next(
