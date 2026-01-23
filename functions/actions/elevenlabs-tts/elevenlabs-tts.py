@@ -9,13 +9,13 @@ icon_url: data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHhtbG5z
 required_open_webui_version: 0.3.10
 """
 
-import requests
+import aiohttp
 import uuid
 import os
 import io
 import base64
 from pydantic import BaseModel, Field
-from typing import Callable, Union, Any, Dict, Tuple
+from typing import Callable, Any
 from open_webui.config import UPLOAD_DIR
 from open_webui.models.files import Files, FileForm
 from open_webui.storage.provider import Storage
@@ -42,17 +42,16 @@ class Action:
         description: str = "Unknown State",
         status: str = "in_progress",
         done: bool = False,
-    ) -> Dict:
+    ) -> dict[str, Any]:
         return {
             "type": "status",
             "data": {
-                "status": status,
                 "description": description,
                 "done": done,
             },
         }
 
-    async def fetch_available_voices(self) -> Tuple[str, Dict[str, str]]:
+    async def fetch_available_voices(self) -> tuple[str, dict[str, str]]:
         if DEBUG:
             print("Debug: Fetching available voices")
 
@@ -64,35 +63,43 @@ class Action:
 
         voices_url = f"{base_url}/voices"
         try:
-            response = requests.get(voices_url, headers=headers)
-            response.raise_for_status()
-            voices_data = response.json()
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.get(voices_url, headers=headers) as response:
+                    response.raise_for_status()
+                    voices_data = await response.json()
 
-            display_message = "Available voices from ElevenLabs:\n\n"
-            voice_options = {}
-            for voice in voices_data.get("voices", []):
-                voice_name = voice["name"]
-                voice_id = voice["voice_id"]
-                display_message += f"- {voice_name}\n"
-                voice_options[voice_name] = voice_id
+                    display_message = f"Select a voice from the {len(voices_data.get('voices', []))} available options:"
+                    voice_options = {}
+                    for voice in voices_data.get("voices", []):
+                        voice_name = voice["name"]
+                        voice_id = voice["voice_id"]
+                        voice_options[voice_name] = voice_id
 
+                    if DEBUG:
+                        print(f"Debug: Found {len(voices_data.get('voices', []))} voices")
+
+                    return display_message, voice_options
+
+        except aiohttp.ClientResponseError as e:
             if DEBUG:
-                print(f"Debug: Found {len(voices_data.get('voices', []))} voices")
-
-            return display_message, voice_options
-
-        except requests.RequestException as e:
+                print(f"Debug: HTTP error fetching voices: {e.status} - {e.message}")
+            return f"Sorry, couldn't fetch available voices at the moment (HTTP {e.status}).", {}
+        except aiohttp.ClientError as e:
             if DEBUG:
-                print(f"Debug: Error fetching voices: {str(e)}")
+                print(f"Debug: Network error fetching voices: {str(e)}")
+            return "Sorry, couldn't fetch available voices at the moment (network error).", {}
+        except Exception as e:
+            if DEBUG:
+                print(f"Debug: Unexpected error fetching voices: {str(e)}")
             return "Sorry, couldn't fetch available voices at the moment.", {}
 
     async def action(
         self,
         body: dict,
         __user__: dict = {},
-        __event_emitter__: Callable[[dict], Any] = None,
-        __event_call__: Callable[[dict], Any] = None,
-    ) -> None:
+        __event_emitter__: Callable[[dict[str, Any]], Any] = None,
+        __event_call__: Callable[[dict[str, Any]], Any] = None,
+    ) -> dict[str, Any]:
         if DEBUG:
             print(f"Debug: ElevenLabs TTS action invoked")
 
@@ -102,8 +109,8 @@ class Action:
                     self.status_object("Initializing ElevenLabs Text-to-Speech")
                 )
 
-            if not self.valves.ELEVENLABS_API_KEY:
-                raise ValueError("ElevenLabs API key is not set")
+            if not self.valves.ELEVENLABS_API_KEY or not self.valves.ELEVENLABS_API_KEY.strip():
+                raise ValueError("ElevenLabs API key is not configured. Please set it in the function settings.")
 
             if "id" not in __user__:
                 raise ValueError("User not authenticated")
@@ -112,6 +119,9 @@ class Action:
 
             if not self.voice_id_cache:
                 raise ValueError("No available voices to select")
+
+            if not __event_call__:
+                raise ValueError("Action requires user interaction but event_call is not available")
 
             response = await __event_call__(
                 {
@@ -133,13 +143,19 @@ class Action:
             if DEBUG:
                 print(f"Debug: Voice selection response: {response}")
 
+            # Handle user cancellation or empty response
+            if not response or (isinstance(response, str) and not response.strip()):
+                raise ValueError("Voice selection was cancelled or empty")
+
+            # For select input, response should be the selected option (string)
             if isinstance(response, str):
-                selected_voice_name = response
+                selected_voice_name = response.strip()
             elif isinstance(response, dict):
-                selected_voice_name = response.get("message")
+                selected_voice_name = response.get("message", "").strip()
             else:
                 raise ValueError(f"Unexpected response type: {type(response)}")
 
+            # Validate the selected voice exists in our cache
             selected_voice_id = self.voice_id_cache.get(selected_voice_name)
 
             if DEBUG:
@@ -148,7 +164,7 @@ class Action:
                 )
 
             if not selected_voice_id:
-                raise ValueError(f"Invalid voice selection: {selected_voice_name}")
+                raise ValueError(f"Invalid voice selection: '{selected_voice_name}' not found in available voices")
 
             messages = body.get("messages", [])
             assistant_message = next(
@@ -160,8 +176,8 @@ class Action:
                 None,
             )
 
-            if not assistant_message:
-                raise ValueError("No assistant message to convert")
+            if not assistant_message or not assistant_message.strip():
+                raise ValueError("No assistant message content found to convert to speech")
 
             if __event_emitter__:
                 await __event_emitter__(self.status_object("Generating speech"))
@@ -179,57 +195,88 @@ class Action:
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
             }
 
-            response = requests.post(tts_url, json=payload, headers=headers)
-            response.raise_for_status()
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+                async with session.post(tts_url, json=payload, headers=headers) as response:
+                    response.raise_for_status()
 
-            if response.status_code == 200:
-                audio_data = response.content
-                file_name = f"tts_{uuid.uuid4()}.mp3"
+                    if response.status == 200:
+                        audio_data = await response.read()
+                        file_name = f"tts_{uuid.uuid4()}.mp3"
 
-                file_id = self._create_file(
-                    file_name, "Generated Audio", audio_data, "audio/mpeg", __user__
-                )
-                if file_id:
-                    file_url = self._get_file_url(file_id, file_name)
-                    if __event_emitter__:
-                        await __event_emitter__(
-                            self.status_object(
-                                "Generated successfully", status="complete", done=True
-                            )
+                        file_id = self._create_file(
+                            file_name, "Generated Audio", audio_data, "audio/mpeg", __user__
                         )
-                    if file_url:
-                        await __event_emitter__(
-                            {
-                                "type": "message",
-                                "data": {
-                                    "content": f"""
-🎵 **Audio Generated Successfully!**
+                        if file_id:
+                            file_url = self._get_file_url(file_id)
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    self.status_object(
+                                        "Generated successfully", done=True
+                                    )
+                                )
+                            if file_url:
+                                await __event_emitter__(
+                                    {
+                                        "type": "message",
+                                        "data": {
+                                            "content": f"""
+**Audio Generated Successfully!**
 
-[🎧 Download Audio]({file_url})
+[Download Audio]({file_url})
 
 *Note: Downloading not supported on iOS.*
 """
-                                },
-                            }
-                        )
-                else:
-                    raise ValueError("Error saving audio file")
-            else:
-                raise ValueError(f"Unexpected API response: {response.text}")
+                                        },
+                                    }
+                                )
+                                return {"content": f"Audio generated successfully using ElevenLabs voice **{selected_voice_name}**. Download: {file_url}"}
+                        else:
+                            raise ValueError("Error saving audio file")
+                    else:
+                        response_text = await response.text()
+                        raise ValueError(f"Unexpected API response: {response.status} - {response_text}")
 
-        except Exception as e:
+        except ValueError as e:
+            # Handle user input/validation errors
+            error_msg = f"Validation Error: {str(e)}"
             if DEBUG:
-                print(f"Debug: Error in action method: {str(e)}")
+                print(f"Debug: {error_msg}")
             if __event_emitter__:
                 await __event_emitter__(
-                    self.status_object(f"Error: {str(e)}", status="error", done=True)
+                    self.status_object("Validation failed", done=True)
                 )
+                await __event_emitter__({
+                    "type": "notification",
+                    "data": {
+                        "type": "error",
+                        "content": error_msg
+                    }
+                })
+            return {"content": error_msg}
+
+        except Exception as e:
+            # Handle unexpected errors
+            error_msg = f"Unexpected error: {str(e)}"
+            if DEBUG:
+                print(f"Debug: {error_msg}")
+            if __event_emitter__:
+                await __event_emitter__(
+                    self.status_object("An error occurred", done=True)
+                )
+                await __event_emitter__({
+                    "type": "notification",
+                    "data": {
+                        "type": "error",
+                        "content": error_msg
+                    }
+                })
+            return {"content": error_msg}
 
     def _create_file(
         self,
         file_name: str,
         title: str,
-        content: Union[str, bytes],
+        content: str | bytes,
         content_type: str,
         __user__: dict = {},
     ) -> str:
@@ -277,5 +324,5 @@ class Action:
                 print(f"Debug: Error saving file: {e}")
             return None
 
-    def _get_file_url(self, file_id: str, file_name: str) -> str:
-        return f"/api/v1/files/{file_id}/content/{file_name}"
+    def _get_file_url(self, file_id: str) -> str:
+        return f"/api/v1/files/{file_id}/content"
