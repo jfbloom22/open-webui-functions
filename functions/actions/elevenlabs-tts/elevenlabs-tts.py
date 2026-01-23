@@ -42,6 +42,11 @@ class Action:
             default="Donovan:DMyrgzQFny3JI1Y1paM5:Articulate, Strong and Deep\nJessica:g6xIsTj2HwM6VR4iXFCw:Friendly and Conversational\nMark:1SM7GgM6IMuvQlz2BwM3:ConvoAI\nArcher:Fahco4VZzobUeiPqni1S:Conversational\nBrittney:kPzsL2i3teMYv0FxEYQ6:Fun, Youthful and Informal",
             description="Custom voices in format: VoiceName:VoiceID:Description (one per line). Only these voices will be shown.",
         )
+        AUDIO_FORMAT: str = Field(
+            default="mp3",
+            description="Audio format for generated files. Options: mp3, wav, pcm_16000, ulaw_8000",
+            json_schema_extra={"enum": ["mp3", "wav", "pcm_16000", "ulaw_8000"]},
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -262,6 +267,7 @@ class Action:
                 "text": assistant_message,
                 "model_id": self.valves.ELEVENLABS_MODEL_ID,
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
+                "output_format": self.valves.AUDIO_FORMAT,
             }
 
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -270,10 +276,21 @@ class Action:
 
                     if response.status == 200:
                         audio_data = await response.read()
-                        file_name = f"tts_{uuid.uuid4()}.mp3"
+                        # Use configured audio format for file extension
+                        audio_ext = self.valves.AUDIO_FORMAT
+                        file_name = f"tts_{uuid.uuid4()}.{audio_ext}"
+                        
+                        # Determine MIME type based on format
+                        mime_type_map = {
+                            "mp3": "audio/mpeg",
+                            "wav": "audio/wav",
+                            "pcm_16000": "audio/pcm",
+                            "ulaw_8000": "audio/ulaw",
+                        }
+                        mime_type = mime_type_map.get(audio_ext, "audio/mpeg")
 
                         file_id = self._create_file(
-                            file_name, "Generated Audio", audio_data, "audio/mpeg", __user__
+                            file_name, "Generated Audio", audio_data, mime_type, __user__
                         )
                         if file_id:
                             file_url = self._get_file_url(file_id)

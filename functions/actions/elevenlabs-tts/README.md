@@ -6,10 +6,10 @@ Convert assistant messages to natural-sounding speech using ElevenLabs TTS with 
 
 1. Get an API key from [ElevenLabs](https://elevenlabs.io)
 2. Add your API key to the action's Valves (settings)
-3. (Optional) Add your custom voice IDs to the `CUSTOM_VOICES` setting
+3. (Optional) Set your preferred audio format in `AUDIO_FORMAT` (mp3, wav, pcm_16000, or ulaw_8000)
 4. (Optional) Set your preferred default voice in the `DEFAULT_VOICE` setting
 
-### Adding Custom Voices
+## Adding Custom Voices
 
 Configure exactly which voices you want to use:
 
@@ -32,6 +32,22 @@ Mark:1SM7GgM6IMuvQlz2BwM3:ConvoAI
 3. Click the voice you want
 4. Copy the **Voice ID** (long string like `DMyrgzQFny3JI1Y1paM5`)
 5. Add it to `CUSTOM_VOICES` in the action settings with a description
+
+## Audio Format
+
+### Changing File Format
+
+By default, the action generates **MP3 files**, but you can change this:
+
+1. Open the action settings (Valves)
+2. Find the `AUDIO_FORMAT` field
+3. Choose your preferred format:
+   - **mp3** (default) - Good compression, widely compatible
+   - **wav** - Uncompressed, highest quality, larger files
+   - **pcm_16000** - Raw PCM format, 16kHz sample rate
+   - **ulaw_8000** - Compressed PCM format, 8kHz sample rate
+
+Example: To use WAV format, set `AUDIO_FORMAT` to `wav`
 
 ## Voice Selection
 
