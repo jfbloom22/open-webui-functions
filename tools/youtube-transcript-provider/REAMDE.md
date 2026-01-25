@@ -1,0 +1,1 @@
+Note: this tool does not work because YouTube has a bot detection system.
