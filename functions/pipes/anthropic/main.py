@@ -13,9 +13,12 @@ import os
 import requests
 import json
 import time
+import logging
 from typing import List, Union, Generator, Iterator, Optional, Dict
 from pydantic import BaseModel, Field
 from open_webui.utils.misc import pop_system_message
+
+logger = logging.getLogger(__name__)
 
 
 class Pipe:
@@ -397,18 +400,23 @@ class Pipe:
             else:
                 return self.non_stream_response(url, headers, payload)
         except requests.exceptions.RequestException as e:
-            print(f"Request failed: {e}")
+            logger.error("Anthropic request failed: %s", e)
             return f"Error: Request failed: {e}"
         except Exception as e:
-            print(f"Error in pipe method: {e}")
+            logger.error("Anthropic pipe error: %s", e)
             return f"Error: {e}"
+
+    def _get_request_id(self, response: requests.Response) -> str:
+        """Extract Anthropic request id from response headers if available."""
+        return response.headers.get("request-id", "unknown")
 
     def stream_response(self, url, headers, payload):
         """Handle streaming response with the OpenWebUI thinking tags."""
         try:
             with requests.post(
-                url, headers=headers, json=payload, stream=True, timeout=(3.05, 60)
+                url, headers=headers, json=payload, stream=True, timeout=(3.05, 180)
             ) as response:
+                request_id = self._get_request_id(response)
                 if response.status_code != 200:
                     error_text = response.text
                     try:
@@ -417,13 +425,17 @@ class Pipe:
                             error_text = error_json["error"].get("message", error_text)
                     except:
                         pass
-                    raise Exception(f"HTTP Error {response.status_code}: {error_text}")
+                    raise Exception(
+                        f"HTTP Error {response.status_code} (request_id={request_id}): "
+                        f"{error_text}"
+                    )
 
                 thinking_content = ""
                 is_thinking_block = False
                 is_text_block = False
                 has_yielded_thinking = False
                 has_yielded_think_tag = False
+                parse_errors = 0
 
                 for line in response.iter_lines():
                     if line:
@@ -517,6 +529,22 @@ class Pipe:
                                         yield "</think>"
                                     break
 
+                                # Anthropic can emit stream errors in-band after HTTP 200.
+                                elif data["type"] == "error":
+                                    error_obj = data.get("error", {})
+                                    error_type = error_obj.get("type", "unknown_error")
+                                    error_msg = error_obj.get("message", "Unknown error")
+                                    logger.error(
+                                        "Anthropic stream error: type=%s request_id=%s",
+                                        error_type,
+                                        request_id,
+                                    )
+                                    yield (
+                                        f"Error: Anthropic stream error ({error_type}) "
+                                        f"(request_id={request_id}): {error_msg}"
+                                    )
+                                    break
+
                                 # Handle single message (non-streaming style response in stream)
                                 elif data["type"] == "message":
                                     has_thinking = False
@@ -558,23 +586,48 @@ class Pipe:
                                 )  # Delay to avoid overwhelming the client
 
                             except json.JSONDecodeError:
-                                print(f"Failed to parse JSON: {line}")
+                                parse_errors += 1
+                                logger.warning(
+                                    "Failed to parse Anthropic stream JSON "
+                                    "(request_id=%s, count=%d)",
+                                    request_id,
+                                    parse_errors,
+                                )
+                                if parse_errors >= 3:
+                                    yield (
+                                        "Error: Anthropic stream parse failure "
+                                        f"(request_id={request_id})"
+                                    )
+                                    break
                             except KeyError as e:
-                                print(f"Unexpected data structure: {e}")
-                                print(f"Full data: {data}")
+                                parse_errors += 1
+                                logger.warning(
+                                    "Unexpected Anthropic stream structure: %s "
+                                    "(request_id=%s, count=%d)",
+                                    e,
+                                    request_id,
+                                    parse_errors,
+                                )
+                                if parse_errors >= 3:
+                                    yield (
+                                        "Error: Anthropic stream protocol mismatch "
+                                        f"(request_id={request_id})"
+                                    )
+                                    break
         except requests.exceptions.RequestException as e:
-            print(f"Request failed: {e}")
+            logger.error("Anthropic stream request failed: %s", e)
             yield f"Error: Request failed: {e}"
         except Exception as e:
-            print(f"General error in stream_response method: {e}")
+            logger.error("Anthropic stream error: %s", e)
             yield f"Error: {e}"
 
     def non_stream_response(self, url, headers, payload):
         """Handle non-streaming response from Anthropic API, including thinking blocks."""
         try:
             response = requests.post(
-                url, headers=headers, json=payload, timeout=(3.05, 60)
+                url, headers=headers, json=payload, timeout=(3.05, 180)
             )
+            request_id = self._get_request_id(response)
             if response.status_code != 200:
                 error_text = response.text
                 try:
@@ -583,7 +636,10 @@ class Pipe:
                         error_text = error_json["error"].get("message", error_text)
                 except:
                     pass
-                raise Exception(f"HTTP Error {response.status_code}: {error_text}")
+                raise Exception(
+                    f"HTTP Error {response.status_code} (request_id={request_id}): "
+                    f"{error_text}"
+                )
 
             res = response.json()
 
@@ -616,5 +672,5 @@ class Pipe:
             result += text_content
             return result
         except requests.exceptions.RequestException as e:
-            print(f"Failed non-stream request: {e}")
+            logger.error("Anthropic non-stream request failed: %s", e)
             return f"Error: {e}"
