@@ -3,10 +3,10 @@ title: Anthropic Manifold Pipe with Extended Thinking and Cache Control
 authors: justinh-rahb, christian-taillon, jfbloom22, Mark Kazakov, Vincent, NIK-NUB, cache control added by Snav
 author_url: https://github.com/jfbloom22
 funding_url: https://github.com/open-webui
-version: 0.5.0
+version: 0.5.1
 required_open_webui_version: 0.3.17
 license: MIT
-description: An advanced manifold pipe for interacting with Anthropic's Claude models, featuring extended thinking support, cache control, beta features, and sophisticated model handling for Claude 4.5.
+description: An advanced manifold pipe for interacting with Anthropic's Claude models, featuring extended thinking support, cache control, beta features, and model-specific handling for Claude 4.7 and earlier Claude 4 releases.
 """
 
 import os
@@ -28,7 +28,11 @@ class Pipe:
         ANTHROPIC_API_KEY: str = Field(default="", description="Anthropic API Key")
         CLAUDE_USE_TEMPERATURE: bool = Field(
             default=True,
-            description="For Claude 4.x models (Opus 4, Sonnet 4.5, Haiku 3.5+): Use temperature (True) or top_p (False). Claude 4.x models only support one parameter.",
+            description="For older Claude 4.x models (pre-Opus 4.7): Use temperature (True) or top_p (False). Claude Opus 4.7+ rejects temperature, top_p, and top_k.",
+        )
+        CLAUDE_EFFORT: str = Field(
+            default="high",
+            description="Effort level for Claude Opus 4.7+ (low, medium, high, xhigh, max).",
         )
         BETA_FEATURES: str = Field(
             default="",
@@ -54,6 +58,7 @@ class Pipe:
             **{
                 "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
                 "CLAUDE_USE_TEMPERATURE": True,  # Use temperature for Claude 4.x models
+                "CLAUDE_EFFORT": "high",
                 "BETA_FEATURES": "",
                 "ENABLE_THINKING": True,
                 "THINKING_BUDGET": 16000,
@@ -237,6 +242,22 @@ class Pipe:
 
         return bool(re.match(pattern, model_name)) or bool(re.match(haiku_pattern, model_name))
 
+    def _is_opus_47_or_newer(self, model_name: str) -> bool:
+        """
+        Determine if a model is Claude Opus 4.7 or a later Opus 4 release.
+
+        Claude Opus 4.7 removed support for temperature, top_p, top_k, and manual
+        extended thinking budgets. The model family should use adaptive thinking
+        with effort instead.
+        """
+        import re
+
+        match = re.match(r"^claude-opus-4-(\d+)(?:-\d{8})?$", model_name)
+        if not match:
+            return False
+
+        return int(match.group(1)) >= 7
+
     def pipes(self) -> List[dict]:
         return self.get_anthropic_models()
 
@@ -357,21 +378,28 @@ class Pipe:
         if system_blocks:
             payload["system"] = system_blocks
 
-        # Only add top_k if thinking is NOT enabled
-        if not will_enable_thinking:
-            payload["top_k"] = body.get("top_k", 40)
-
         # Add extended thinking for Claude 4.5 Sonnet with thinking
         if will_enable_thinking:
             # Ensure thinking budget is within reasonable limits (1024-32000 tokens)
             thinking_budget = max(1024, min(32000, self.valves.THINKING_BUDGET))
             payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
 
-        # Handle temperature/top_p settings based on model generation
-        # Claude 4.x models only support either temperature OR top_p, not both
+        # Opus 4.7+ uses adaptive thinking and rejects legacy sampling parameters.
+        is_opus_47_or_newer = self._is_opus_47_or_newer(api_model_name)
         is_claude_4x_model = self._is_claude_4x_model(api_model_name)
 
-        if is_claude_4x_model:
+        if is_opus_47_or_newer:
+            payload["output_config"] = {"effort": self.valves.CLAUDE_EFFORT}
+            if self.valves.ENABLE_THINKING:
+                payload["thinking"] = {
+                    "type": "adaptive",
+                    "display": (
+                        "summarized" if self.valves.DISPLAY_THINKING else "omitted"
+                    ),
+                }
+        elif is_claude_4x_model:
+            # Claude 4.x models before Opus 4.7 support one sampling knob.
+            payload["top_k"] = body.get("top_k", 40)
             if is_thinking_model:
                 # For thinking model, always use temperature = 1.0
                 payload["temperature"] = 1.0
@@ -381,6 +409,7 @@ class Pipe:
                 payload["top_p"] = body.get("top_p", 0.9)
         else:
             # Other Claude models support both temperature and top_p
+            payload["top_k"] = body.get("top_k", 40)
             payload["temperature"] = body.get("temperature", 0.8)
             payload["top_p"] = body.get("top_p", 0.9)
 

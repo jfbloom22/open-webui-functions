@@ -467,6 +467,16 @@ Solution: Debug model discovery
 5. Test direct API call to /v1/models endpoint
 ```
 
+#### ❌ Opus 4.7 Request Errors
+**Problem**: `HTTP Error 400 ... temperature is deprecated for this model`
+```
+Solution: Remove sampling parameters for Claude Opus 4.7 and later.
+1. Do not send `temperature`, `top_p`, or `top_k` for `claude-opus-4-7`
+2. Use `thinking: {"type": "adaptive"}` instead of manual thinking budgets
+3. Set `output_config={"effort": "high"}` or `xhigh` for more demanding work
+4. Keep `DISPLAY_THINKING` enabled if you want summarized thinking output
+```
+
 #### ❌ Streaming Problems
 **Problem**: Streaming responses not working
 ```
