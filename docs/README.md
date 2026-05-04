@@ -323,8 +323,9 @@ if __event_emitter__:
 
 ### Official Documentation
 - [Open WebUI Docs](https://docs.openwebui.com/)
-- [Functions Overview](https://docs.openwebui.com/features/plugin/functions/)
-- [Event System](https://docs.openwebui.com/features/plugin/events/)
+- [Functions Overview](https://docs.openwebui.com/features/extensibility/plugin/functions/)
+- [Tools Development](https://docs.openwebui.com/features/extensibility/plugin/tools/)
+- [Event System](https://docs.openwebui.com/features/extensibility/plugin/development/events/)
 
 ### Community
 - [Open WebUI GitHub](https://github.com/open-webui/open-webui)

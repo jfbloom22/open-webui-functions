@@ -127,6 +127,132 @@ async def search(
     pass
 ```
 
+## Modern Tool Authoring Rules
+
+### Metadata and Class Contract
+
+Tools are native Python toolkits. Open WebUI expects a top-level `class Tools` with one or
+more typed methods. In Open WebUI itself, a toolkit is a single Python file; in this
+repository, keep the existing contribution layout of `tools/<tool_name>/main.py`.
+
+Top-level metadata should include:
+
+- `title`: Display name
+- `description`: What it does and example user requests
+- `author`: Author name
+- `version`: Semantic version
+- `license`: License name
+- `requirements`: Only pip-installable packages that are truly required
+
+Use `Valves` for admin-managed configuration and `UserValves` for per-user configuration.
+Both should inherit from `pydantic.BaseModel` and use `Field(...)` descriptions.
+
+### Reserved Optional Arguments
+
+Open WebUI can inject these arguments into tool methods when declared:
+
+- `__event_emitter__`: Emit status, citation, notification, file, follow-up, and title events
+- `__event_call__`: Request user confirmation or input
+- `__user__`: User details and `__user__["valves"]`
+- `__metadata__`: Chat metadata, including function-calling mode
+- `__messages__`: Previous messages
+- `__files__`: Attached files
+- `__model__`: Model information
+- `__oauth_token__`: OAuth token payload for authenticated upstream calls
+
+Only add injected arguments that the method actually needs.
+
+### Event Emitter Compatibility
+
+Use `status` events for progress and always finish with `done: True`:
+
+```python
+if __event_emitter__:
+    await __event_emitter__({
+        "type": "status",
+        "data": {
+            "description": "Fetching data...",
+            "done": False,
+            "hidden": False,
+        },
+    })
+```
+
+For native function-calling compatibility, prefer these event types:
+
+- `status`
+- `citation`
+- `notification`
+- `files`
+- `chat:title`
+- `chat:message:follow_ups`
+
+Avoid `message`, `chat:message:delta`, `chat:message`, and `replace` from Tools when native
+function-calling mode may be used. Native completion snapshots can overwrite those updates.
+
+When emitting custom citations, set `self.citation = False` in `__init__` so automatic
+citations do not replace your custom events:
+
+```python
+class Tools:
+    def __init__(self):
+        self.valves = self.Valves()
+        self.citation = False
+```
+
+### Rich HTML Cards
+
+Return `HTMLResponse` when a tool should render an inline UI card in chat:
+
+```python
+from fastapi.responses import HTMLResponse
+
+return HTMLResponse(
+    content=html_content,
+    headers={"Content-Disposition": "inline"},
+)
+```
+
+HTML card conventions:
+
+- Use `html, body { background: transparent; }` because the card runs in a chat iframe
+- Use inline CSS and inline scripts; avoid external assets unless necessary
+- Keep card content responsive and readable around 600-800px max width
+- Escape all user/API content before embedding it into HTML
+- Include a height reporter so the iframe resizes with content
+
+```html
+<script>
+function reportHeight() {
+    const height = document.documentElement.scrollHeight;
+    parent.postMessage({type: "iframe:height", height}, "*");
+}
+window.addEventListener("load", reportHeight);
+if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(reportHeight).observe(document.body);
+}
+</script>
+```
+
+### HTTP and Runtime Conventions
+
+- Prefer `httpx.AsyncClient` or `aiohttp` for new async HTTP work
+- Always set a `User-Agent`, timeout, and `raise_for_status()` equivalent
+- Return actionable error strings or typed error objects
+- Avoid adding dependencies unless they clearly reduce complexity
+- For production deployments with multiple workers, preinstall frontmatter requirements and consider `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=False`
+
+### Python Version Compatibility
+
+Open WebUI deployments commonly run Python 3.10/3.11. Avoid Python 3.12-only syntax.
+For complex f-strings, precompute dict/list access first so quoting stays unambiguous:
+
+```python
+name = data["name"]
+last_price = prices[-1]
+return f"{name}: ${last_price}"
+```
+
 ## Complete Web Search Tool Example
 
 ```python
@@ -696,6 +822,10 @@ async def test_search_web_no_api_key():
 - [ ] Return values match type hints
 - [ ] Error handling works properly
 - [ ] Event emitters send updates
+- [ ] Native/default function-calling behavior is checked when events are used
+- [ ] Custom citations set `self.citation = False`
+- [ ] HTML cards use inline content disposition and resize correctly
+- [ ] HTTP calls set `User-Agent`, timeout, and status handling
 - [ ] User context is accessible
 - [ ] Rate limiting works (if implemented)
 - [ ] Caching works (if implemented)
@@ -711,6 +841,9 @@ async def test_search_web_no_api_key():
 6. **No input validation** - Validate parameters before use
 7. **Poor return values** - Return structured, typed data
 8. **Forgetting event emitters** - Provide status updates
+9. **Native-mode event conflicts** - Avoid message replacement events in native mode
+10. **Unsafe HTML cards** - Escape content and use transparent iframe backgrounds
+11. **Runtime pip races** - Preinstall requirements in multi-worker deployments
 
 ## Best Practices Summary
 
@@ -724,9 +857,13 @@ async def test_search_web_no_api_key():
 8. **Caching when appropriate** - Cache expensive operations
 9. **Rate limiting** - Protect external APIs
 10. **Logging** - Log for debugging and monitoring
+11. **Mode-aware events** - Use native-compatible events unless default mode is required
+12. **Inline rich UI carefully** - Use `HTMLResponse` cards only when visual output improves the workflow
 
 ## Additional Resources
 
-- [Tools Documentation](https://docs.openwebui.com/features/plugin/tools/)
+- [Tools Documentation](https://docs.openwebui.com/features/extensibility/plugin/tools/)
+- [Events Documentation](https://docs.openwebui.com/features/extensibility/plugin/development/events/)
+- [Valves Documentation](https://docs.openwebui.com/features/extensibility/plugin/development/valves/)
 - [Example Tools](https://openwebui.com/search?type=tool)
 - [Type Hints Guide](https://typing.python.org/en/latest/)

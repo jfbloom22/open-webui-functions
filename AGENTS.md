@@ -25,6 +25,8 @@ You are an expert Open WebUI extension developer with deep knowledge of Python, 
 6. **Documentation first** - Every function needs a docstring with metadata (title, author, version, requirements)
 7. **Security by design** - Never hardcode secrets, validate all inputs, sanitize outputs
 8. **Test thoroughly** - Validate with different inputs, edge cases, and error conditions
+9. **Provider compatibility first** - Verify current upstream API docs before adding or changing model-specific request parameters
+10. **Agent-friendly implementation** - Keep payload builders, event helpers, and card renderers small and testable
 
 ### Code Standards
 
@@ -35,6 +37,7 @@ You are an expert Open WebUI extension developer with deep knowledge of Python, 
 - Maximum line length: 100 characters
 - Use docstrings for all classes and functions
 - Add inline comments for complex logic
+- Open WebUI commonly runs on Python 3.10/3.11. Avoid Python 3.12-only syntax, and precompute complex dict/list access before f-strings when quoting would be ambiguous.
 
 ### Open WebUI Specific Knowledge
 
@@ -63,10 +66,64 @@ You are an expert Open WebUI extension developer with deep knowledge of Python, 
 - Return modified content or new files
 
 **Tools (Function Calling)**
-- Simple function calls from the model
+- Native Python toolkits called by the model during inference
+- Define a top-level `class Tools` with one or more async methods
 - Must have comprehensive type hints for JSON schema generation
-- Support async execution patterns
-- Handle file uploads and processing
+- Method docstrings act as LLM tool-use instructions; write clear "use this when / do not use this when" guidance
+- Support `Valves` for admin settings and `UserValves` for per-user settings
+- Can return `str`, `HTMLResponse`, or `(HTMLResponse, str)` depending on whether the tool should render UI, feed text back to the model, or both
+- Handle file uploads, OAuth tokens, chat metadata, and model context through reserved injected arguments when needed
+
+#### Tools Development Pattern
+
+Tools are single-file Python toolkits in Open WebUI. In this repository, keep the contribution layout consistent with existing tools under `tools/<tool_name>/main.py`.
+
+```python
+"""
+title: Tool Name
+description: What it does, plus example user requests.
+author: Your Name
+version: 1.0.0
+license: MIT
+requirements: httpx, pydantic
+"""
+
+from collections.abc import Awaitable, Callable
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+
+class Tools:
+    class Valves(BaseModel):
+        api_key: str = Field(default="", description="API key for the upstream API")
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def lookup(
+        self,
+        query: str,
+        __event_emitter__: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> HTMLResponse | str:
+        """
+        Look up information and render a compact result card.
+
+        Use this when the user asks for current data from the configured service.
+        Do not use this for general reasoning or unsupported providers.
+
+        :param query: Search query or entity name.
+        :return: Inline HTML card, or an error string if lookup fails.
+        """
+        ...
+```
+
+Use optional injected arguments intentionally:
+- `__event_emitter__` for status, citation, notification, file, follow-up, and title events
+- `__event_call__` for confirmation/input flows
+- `__user__` for user data and `__user__["valves"]`
+- `__metadata__` for chat metadata, including function-calling mode checks
+- `__messages__`, `__files__`, and `__model__` for chat context
+- `__oauth_token__` for authenticated API calls on behalf of the user
 
 #### Event System
 
@@ -82,6 +139,10 @@ await __event_emitter__({
     "data": {"type": "info", "content": "Success message"}
 })
 ```
+
+For native function-calling compatibility, prefer `status`, `citation`, `notification`, `files`, `chat:title`, and `chat:message:follow_ups`. Avoid tool-emitted `message`, `chat:message:delta`, `chat:message`, and `replace` events when native mode may be used because model completion snapshots can overwrite them.
+
+When emitting custom citations from a Tool, set `self.citation = False` in `__init__` so Open WebUI automatic citations do not replace the custom citation events.
 
 **Event Call Patterns**
 ```python
@@ -105,6 +166,33 @@ user_input = await __event_call__({
 })
 ```
 
+#### Rich HTML Tool Cards
+
+When a Tool should render UI in chat, return `fastapi.responses.HTMLResponse` with an inline content-disposition header:
+
+```python
+return HTMLResponse(
+    content=html_content,
+    headers={"Content-Disposition": "inline"},
+)
+```
+
+HTML cards should be self-contained:
+- Use inline `<style>` and inline scripts only
+- Set `html, body { background: transparent; }` because cards render inside chat iframes
+- Keep cards compact, responsive, and readable around 600-800px max width
+- Include an iframe height reporting script using `parent.postMessage({type: "iframe:height", height}, "*")`
+- Escape untrusted content before inserting it into HTML
+- Use CSS variables for theme tokens and avoid external assets unless necessary
+
+#### HTTP and Runtime Patterns
+
+- Prefer `httpx.AsyncClient` for new async I/O; use existing libraries only when preserving local style
+- Always set a `User-Agent`, a finite timeout, and call `raise_for_status()` or equivalent
+- Return actionable errors and emit a final `status` event with `done: True`
+- Avoid runtime dependency surprises. In multi-worker deployments, frontmatter `requirements` should be preinstalled and `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=False` should be considered
+- Do not introduce new dependencies unless they materially simplify the implementation or are already common in the repo
+
 #### Metadata Template
 
 ```python
@@ -120,6 +208,8 @@ license: MIT
 description: Brief description of functionality
 """
 ```
+
+For Tools, the top-level metadata should include at least `title`, `description`, `author`, `version`, and `license`. Include `requirements` only for pip-installable packages that are truly required.
 
 ### Common Patterns
 
@@ -166,6 +256,16 @@ else:
     return response.json()
 ```
 
+#### Provider API Compatibility
+
+External model APIs can change parameter support by model version. Build provider pipes with explicit capability checks rather than assuming one payload shape works for every model.
+
+- Keep model ID parsing isolated in small helpers
+- Omit unsupported optional params instead of sending defaults
+- Preserve request IDs from upstream errors when available
+- Add regression smoke tests for payload construction
+- For Anthropic Claude Opus 4.7 and later, do not send `temperature`, `top_p`, `top_k`, or manual thinking budgets; use `output_config.effort` and adaptive thinking when enabled
+
 ### Development Workflow
 
 1. **Research**: Review similar existing functions in the repository
@@ -197,6 +297,9 @@ else:
 - [ ] Error cases display helpful messages
 - [ ] Type hints generate correct JSON schema
 - [ ] Streaming responses work correctly
+- [ ] Tool HTML cards return `HTMLResponse` with inline content disposition and resize correctly
+- [ ] Native/default function-calling mode behavior is checked when events are used
+- [ ] Provider payloads omit unsupported model-specific parameters
 - [ ] No hardcoded secrets or credentials
 - [ ] Documentation is clear and complete
 - [ ] Code follows repository conventions
@@ -213,11 +316,18 @@ else:
 8. **Incorrect model ID extraction** - Parse body["model"] correctly
 9. **Missing required_open_webui_version** - Specify minimum version
 10. **Over-engineering** - Keep solutions simple and focused
+11. **Native-mode event conflicts** - Do not rely on message replacement events from Tools in native function-calling mode
+12. **Unsafe HTML cards** - Escape user/API content, avoid external scripts by default, and keep iframe backgrounds transparent
+13. **Provider parameter drift** - Do not assume older model parameters are accepted by newly released models
+14. **Runtime pip races** - Avoid relying on frontmatter installs in multi-worker deployments
 
 ### References
 
 - [Open WebUI Documentation](https://docs.openwebui.com/)
-- [Functions Overview](https://docs.openwebui.com/features/plugin/functions/)
+- [Functions Overview](https://docs.openwebui.com/features/extensibility/plugin/functions/)
+- [Tools Development](https://docs.openwebui.com/features/extensibility/plugin/tools/)
+- [Events](https://docs.openwebui.com/features/extensibility/plugin/development/events/)
+- [Valves](https://docs.openwebui.com/features/extensibility/plugin/development/valves/)
 - [Community Functions](https://openwebui.com/)
 - [Repository](https://github.com/open-webui/functions)
 

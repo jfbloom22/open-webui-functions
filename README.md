@@ -24,10 +24,10 @@ Curated custom functions approved by the Open WebUI core team.
 Check out these links for more information and help with Functions:
 
 - 🛠️ [Plugins Overview](https://docs.openwebui.com/features/plugin/)
-- 🧰 [Functions](https://docs.openwebui.com/features/plugin/functions/)
-- 🚰 [Pipe Function](https://docs.openwebui.com/features/plugin/functions/pipe)
-- 🪄 [Filter Function](https://docs.openwebui.com/features/plugin/functions/filter)
-- 🎬 [Action Function](https://docs.openwebui.com/features/plugin/functions/action)
+- 🧰 [Functions](https://docs.openwebui.com/features/extensibility/plugin/functions/)
+- 🚰 [Pipe Function](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe/)
+- 🪄 [Filter Function](https://docs.openwebui.com/features/extensibility/plugin/functions/filter/)
+- 🎬 [Action Function](https://docs.openwebui.com/features/extensibility/plugin/functions/action/)
 
 ## 🌐 Community
 
