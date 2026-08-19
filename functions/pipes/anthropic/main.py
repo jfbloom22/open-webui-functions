@@ -3,10 +3,10 @@ title: Anthropic Manifold Pipe with Extended Thinking and Cache Control
 authors: justinh-rahb, christian-taillon, jfbloom22, Mark Kazakov, Vincent, NIK-NUB, cache control added by Snav
 author_url: https://github.com/jfbloom22
 funding_url: https://github.com/open-webui
-version: 0.5.1
+version: 0.6.0
 required_open_webui_version: 0.3.17
 license: MIT
-description: An advanced manifold pipe for interacting with Anthropic's Claude models, featuring extended thinking support, cache control, beta features, and model-specific handling for Claude 4.7 and earlier Claude 4 releases.
+description: Anthropic manifold pipe with adaptive thinking, cache control, and model-aware parameters.
 """
 
 import os
@@ -28,7 +28,10 @@ class Pipe:
         ANTHROPIC_API_KEY: str = Field(default="", description="Anthropic API Key")
         CLAUDE_USE_TEMPERATURE: bool = Field(
             default=True,
-            description="For older Claude 4.x models (pre-Opus 4.7): Use temperature (True) or top_p (False). Claude Opus 4.7+ rejects temperature, top_p, and top_k.",
+            description=(
+                "For older Claude models, use temperature (True) or top_p (False). "
+                "Adaptive-thinking models reject non-default sampling."
+            ),
         )
         CLAUDE_EFFORT: str = Field(
             default="high",
@@ -242,21 +245,23 @@ class Pipe:
 
         return bool(re.match(pattern, model_name)) or bool(re.match(haiku_pattern, model_name))
 
-    def _is_opus_47_or_newer(self, model_name: str) -> bool:
+    def _requires_adaptive_thinking(self, model_name: str) -> bool:
         """
-        Determine if a model is Claude Opus 4.7 or a later Opus 4 release.
+        Determine whether a model requires adaptive thinking and default sampling.
 
-        Claude Opus 4.7 removed support for temperature, top_p, top_k, and manual
-        extended thinking budgets. The model family should use adaptive thinking
-        with effort instead.
+        Claude Opus 4.7 and later, Claude Sonnet 5, and Claude Fable 5 reject
+        non-default temperature, top_p, and top_k. They also require adaptive,
+        rather than manual, thinking.
         """
         import re
 
-        match = re.match(r"^claude-opus-4-(\d+)(?:-\d{8})?$", model_name)
-        if not match:
-            return False
+        if re.match(
+            r"^claude-(?:sonnet|fable|mythos|opus)-5(?:-\d{8})?$", model_name
+        ):
+            return True
 
-        return int(match.group(1)) >= 7
+        match = re.match(r"^claude-opus-4-(\d+)(?:-\d{8})?$", model_name)
+        return bool(match and int(match.group(1)) >= 7)
 
     def pipes(self) -> List[dict]:
         return self.get_anthropic_models()
@@ -384,11 +389,11 @@ class Pipe:
             thinking_budget = max(1024, min(32000, self.valves.THINKING_BUDGET))
             payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
 
-        # Opus 4.7+ uses adaptive thinking and rejects legacy sampling parameters.
-        is_opus_47_or_newer = self._is_opus_47_or_newer(api_model_name)
+        # Current adaptive-thinking models reject non-default sampling parameters.
+        requires_adaptive_thinking = self._requires_adaptive_thinking(api_model_name)
         is_claude_4x_model = self._is_claude_4x_model(api_model_name)
 
-        if is_opus_47_or_newer:
+        if requires_adaptive_thinking:
             payload["output_config"] = {"effort": self.valves.CLAUDE_EFFORT}
             if self.valves.ENABLE_THINKING:
                 payload["thinking"] = {
