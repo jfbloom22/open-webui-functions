@@ -3,7 +3,7 @@ title: Anthropic Claude Manifold Pipe
 authors: justinh-rahb, christian-taillon, jfbloom22, Mark Kazakov, Vincent, NIK-NUB, Snav
 author_url: https://github.com/jfbloom22
 funding_url: https://github.com/open-webui
-version: 0.7.0
+version: 0.7.2
 required_open_webui_version: 0.4.0
 requirements: httpx
 license: MIT
@@ -38,7 +38,7 @@ class Pipe:
     API_URL = "https://api.anthropic.com/v1/messages"
     MODELS_URL = "https://api.anthropic.com/v1/models"
     API_VERSION = "2023-06-01"
-    USER_AGENT = "open-webui-anthropic-manifold/0.7.0"
+    USER_AGENT = "open-webui-anthropic-manifold/0.7.2"
     MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
     class Valves(BaseModel):
@@ -420,8 +420,15 @@ class Pipe:
             payload["output_config"] = {"effort": self._valid_effort(model)}
             return
         if self.valves.ENABLE_THINKING and thinking_mode == "manual":
-            budget = max(1024, min(32768, self.valves.THINKING_BUDGET))
-            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # Anthropic requires the thinking budget to be strictly below max_tokens.
+            # Keep manual thinking enabled for ordinary chat requests, but skip it for
+            # intentionally tiny completions rather than sending an invalid request.
+            max_budget = int(payload["max_tokens"]) - 1
+            if max_budget >= 1024:
+                budget = min(32768, self.valves.THINKING_BUDGET, max_budget)
+                payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            else:
+                logger.info("Skipping manual thinking because max_tokens is below 1025.")
 
         if thinking_mode != "adaptive":
             for parameter in ("temperature", "top_p", "top_k"):
@@ -580,6 +587,7 @@ class Pipe:
                 payload["messages"].append({"role": "assistant", "content": response["content"]})
                 results = await self._execute_tools(tool_blocks, tool_registry, event_emitter)
                 payload["messages"].append({"role": "user", "content": results})
+                self._allow_final_response_after_tool_use(payload)
         return "Error: Anthropic tool-call loop ended unexpectedly."
 
     async def _create_message(
@@ -658,6 +666,26 @@ class Pipe:
         text = "".join(text_parts)
         return f"<think>{thinking}</think>{text}" if thinking else text
 
+    def _allow_final_response_after_tool_use(self, payload: dict[str, Any]) -> None:
+        """Release a required initial tool choice so Claude can answer after tool results."""
+        if payload.get("tool_choice", {}).get("type") in {"any", "tool"}:
+            payload["tool_choice"] = {"type": "auto"}
+
+    def _stream_reasoning_delta(self, model: str, reasoning: str) -> str:
+        """Return an OpenAI-shaped SSE reasoning delta understood by current Open WebUI."""
+        return "data: " + json.dumps(
+            {
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning_content": reasoning},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
     async def _stream_with_status(
         self,
         payload: dict[str, Any],
@@ -693,7 +721,14 @@ class Pipe:
                 async with client.stream(
                     "POST", self._api_url("/v1/messages"), headers=self._headers(), json=payload
                 ) as response:
-                    response.raise_for_status()
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as error:
+                        # httpx does not expose .json() or .text for streamed responses until
+                        # their body has been read. Do that before rendering the provider error.
+                        await response.aread()
+                        yield f"Error: Anthropic stream error: {self._describe_http_error(error)}"
+                        return
                     async for line in response.aiter_lines():
                         if not line.startswith("data: "):
                             continue
@@ -714,7 +749,6 @@ class Pipe:
                             blocks[index] = block
                             if block.get("type") == "thinking" and self.valves.DISPLAY_THINKING:
                                 thinking_open = True
-                                yield "<think>"
                             continue
                         if event_type == "content_block_delta":
                             index = int(event.get("index", 0))
@@ -729,7 +763,7 @@ class Pipe:
                                 thinking = delta.get("thinking", "")
                                 block["thinking"] = block.get("thinking", "") + thinking
                                 if self.valves.DISPLAY_THINKING:
-                                    yield thinking
+                                    yield self._stream_reasoning_delta(payload["model"], thinking)
                             elif delta_type == "signature_delta":
                                 block["signature"] = delta.get("signature", "")
                             elif delta_type == "input_json_delta":
@@ -742,7 +776,6 @@ class Pipe:
                             block = blocks.get(index, {})
                             if block.get("type") == "thinking" and thinking_open:
                                 thinking_open = False
-                                yield "</think>"
                             if block.get("type") == "tool_use":
                                 raw_input = block.pop("_input_json", "")
                                 try:
@@ -755,8 +788,6 @@ class Pipe:
                         if event_type == "message_stop":
                             break
 
-                if thinking_open:
-                    yield "</think>"
                 content = [blocks[index] for index in sorted(blocks)]
                 tool_blocks = [block for block in content if block.get("type") == "tool_use"]
                 if not tool_blocks or stop_reason != "tool_use":
@@ -773,6 +804,7 @@ class Pipe:
                 payload["messages"].append({"role": "assistant", "content": content})
                 results = await self._execute_tools(tool_blocks, tool_registry, event_emitter)
                 payload["messages"].append({"role": "user", "content": results})
+                self._allow_final_response_after_tool_use(payload)
 
     async def _emit_status(
         self, emitter: EventEmitter | None, description: str, done: bool
