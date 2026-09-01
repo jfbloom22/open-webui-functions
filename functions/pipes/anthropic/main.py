@@ -717,7 +717,6 @@ class Pipe:
             for tool_round in range(self.valves.MAX_TOOL_ROUNDS + 1):
                 blocks: dict[int, dict[str, Any]] = {}
                 stop_reason = ""
-                thinking_open = False
                 async with client.stream(
                     "POST", self._api_url("/v1/messages"), headers=self._headers(), json=payload
                 ) as response:
@@ -747,8 +746,6 @@ class Pipe:
                             index = int(event.get("index", 0))
                             block = dict(event.get("content_block", {}))
                             blocks[index] = block
-                            if block.get("type") == "thinking" and self.valves.DISPLAY_THINKING:
-                                thinking_open = True
                             continue
                         if event_type == "content_block_delta":
                             index = int(event.get("index", 0))
@@ -774,8 +771,6 @@ class Pipe:
                         if event_type == "content_block_stop":
                             index = int(event.get("index", 0))
                             block = blocks.get(index, {})
-                            if block.get("type") == "thinking" and thinking_open:
-                                thinking_open = False
                             if block.get("type") == "tool_use":
                                 raw_input = block.pop("_input_json", "")
                                 try:
