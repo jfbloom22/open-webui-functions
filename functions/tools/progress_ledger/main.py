@@ -2,7 +2,7 @@
 title: Progress Ledger
 author: Workplace Labs
 description: Lightweight per-user workflow state for assistants and scheduled automations.
-version: 1.0.1
+version: 1.0.0
 license: MIT
 """
 

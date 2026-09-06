@@ -1,4 +1,4 @@
-# Progress Ledger v1.0.1
+# Progress Ledger
 
 Reusable Open WebUI Workspace Tool for durable, per-user workflow state across
 independent chats and scheduled automations.
