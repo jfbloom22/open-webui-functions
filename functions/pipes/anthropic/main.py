@@ -479,7 +479,9 @@ class Pipe:
     ) -> tuple[list[dict[str, Any]], ToolRegistry]:
         """Build Anthropic tool definitions from injected Open WebUI callable tools."""
         params = (metadata or {}).get("params", {})
-        if not registry or params.get("function_calling") != "native":
+        # Open WebUI's native function-calling mode is the default. Only the
+        # explicit legacy mode uses prompt injection instead of native tools.
+        if not registry or params.get("function_calling", "native") == "legacy":
             return [], {}
 
         definitions: list[dict[str, Any]] = []

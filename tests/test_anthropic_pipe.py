@@ -121,6 +121,25 @@ class AnthropicPipeTests(unittest.TestCase):
         self.assertEqual(payload["tools"][0]["input_schema"]["required"], ["location"])
         self.assertIn("weather", tools)
 
+    def test_default_function_calling_mode_keeps_openwebui_tools(self) -> None:
+        """Treat omitted function-calling mode as native, including generate_image."""
+
+        def generate_image(prompt: str) -> str:
+            """Generate an image from a prompt."""
+            return prompt
+
+        payload, tools = self.pipe._build_payload(
+            {
+                "model": "anthropic/claude-sonnet-5",
+                "messages": [{"role": "user", "content": "Make an icon."}],
+            },
+            {},
+            {"generate_image": {"callable": generate_image}},
+        )
+
+        self.assertEqual(payload["tools"][0]["name"], "generate_image")
+        self.assertIn("generate_image", tools)
+
     def test_manual_thinking_preserves_explicit_sampling(self) -> None:
         """Use manual thinking only for model families that still support it."""
         def calculator(expression: str) -> str:
