@@ -641,6 +641,11 @@ class Pipe:
                     )
                 results.append(self._tool_result_block(tool_use_id, output))
             except TimeoutError:
+                logger.warning(
+                    "Anthropic tool %s timed out after %.1f seconds",
+                    name,
+                    self.valves.TOOL_TIMEOUT_SECONDS,
+                )
                 results.append(
                     self._tool_result_block(
                         tool_use_id,
