@@ -1,17 +1,15 @@
 """
-title: ElevenLabs TTS, Enhanced native attachment
+title: ElevenLabs TTS
 author: Workplace Labs
-version: 1.1.0
+version: 0.3.6
 license: MIT
 requirements: aiohttp, pydantic
-description: Generate speech from the latest assistant reply as a persisted, native Open WebUI MP3 attachment with clear preview and download guidance.
+description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
 """
 
 import asyncio
-import base64
 import html
 import io
-import json
 import random
 import re
 import uuid
@@ -89,12 +87,7 @@ def file_content_url(file_id: str, *, attachment: bool = False) -> str:
 
 
 def file_attachment(file_id: str, filename: str, size: int) -> dict[str, Any]:
-    """Shape a generated file for Open WebUI's persisted ``files`` event.
-
-    ``id`` is intentionally the Open WebUI file id, rather than a storage URL.
-    That lets the stock FileItem control open the native file modal, which gives
-    people the Preview tab and its authenticated download affordance.
-    """
+    """Shape a generated file for Open WebUI's native file event."""
     return {
         "type": "file",
         "id": file_id,
@@ -105,42 +98,8 @@ def file_attachment(file_id: str, filename: str, size: int) -> dict[str, Any]:
     }
 
 
-def download_panel_script(audio: bytes, filename: str, voice_name: str) -> str:
-    """Build a visible main-page download control via Open WebUI's execute event."""
-    encoded = base64.b64encode(audio).decode("ascii")
-    return f"""(() => {{
-      const existing = document.getElementById('wl-tts-download-panel'); if (existing) existing.remove();
-      const data = {json.dumps(encoded)}; const filename = {json.dumps(filename)};
-      const panel = document.createElement('div'); panel.id = 'wl-tts-download-panel';
-      panel.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483647;background:#171717;color:#fff;border:1px solid #555;border-radius:12px;padding:14px 16px;box-shadow:0 8px 30px #0008;font:14px system-ui,sans-serif;display:flex;align-items:center;gap:12px';
-      const text = document.createElement('span'); text.textContent = 'Audio ready (' + {json.dumps(voice_name)} + ')';
-      const button = document.createElement('button'); button.textContent = 'Download MP3';
-      button.style.cssText = 'border:0;border-radius:8px;padding:8px 12px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer';
-      button.onclick = () => {{ const binary = atob(data); const bytes = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        const url = URL.createObjectURL(new Blob([bytes], {{type:'audio/mpeg'}})); const link = document.createElement('a'); link.href = url; link.download = filename;
-        document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); }};
-      const close = document.createElement('button'); close.textContent = '×'; close.setAttribute('aria-label', 'Close'); close.style.cssText = 'border:0;background:transparent;color:#aaa;font-size:20px;cursor:pointer'; close.onclick = () => panel.remove();
-      panel.append(text, button, close); document.body.appendChild(panel);
-    }})()"""
-
-
-def file_content_summary(voice_name: str, filename: str) -> str:
-    """Human-readable content for the stock binary-file modal's Content tab."""
-    return (
-        f"This is an MP3 audio file generated with the ElevenLabs voice **{voice_name}**.\n\n"
-        "- Select **Preview** to listen in Open WebUI.\n"
-        "- Click the filename at the top of this dialog, or use its download control, "
-        f"to save `{filename}`."
-    )
-
-
 def message_with_download_link(body: dict, voice_name: str, file_id: str) -> dict[str, Any]:
-    """Update the assistant message without replacing its generated answer.
-
-    The native attachment is the primary UI. The text gives the same discoverable
-    instructions in chat, and keeps a direct download link for clients where the
-    attachment controls are hidden.
-    """
+    """Update the action message with a visible, authenticated download link."""
     messages = body.get("messages", [])
     current = next(
         (
@@ -150,15 +109,10 @@ def message_with_download_link(body: dict, voice_name: str, file_id: str) -> dic
         ),
         "",
     )
-    link = f"[Download MP3]({file_content_url(file_id, attachment=True)})"
-    notice = (
-        f"🎧 **Audio ready, {voice_name}.** Open the attached MP3 to preview it; "
-        "click its filename or download control to save it."
-    )
+    link = f"[Download audio]({file_content_url(file_id, attachment=True)})"
     content = current.rstrip()
     if link not in content:
-        addition = f"{notice}\n\n{link}"
-        content = f"{content}\n\n{addition}" if content else addition
+        content = f"{content}\n\n{link}" if content else link
     message_id = body.get("id")
     if message_id:
         return {"messages": [{"id": message_id, "content": content}]}
@@ -372,10 +326,8 @@ class Action:
                     )
                 )
             audio = await self.generate_audio(voice_id, text)
-            if not audio:
-                raise ValueError("ElevenLabs returned an empty audio file.")
             filename = f"tts_{uuid.uuid4()}.mp3"
-            file_id = await self.create_file(filename, audio, __user__, voice_name)
+            file_id = await self.create_file(filename, audio, __user__)
             if not file_id:
                 raise ValueError(
                     "Audio was generated but could not be saved to your private files."
@@ -389,7 +341,6 @@ class Action:
                         },
                     }
                 )
-                await __event_emitter__({"type": "execute", "data": {"code": download_panel_script(audio, filename, voice_name)}})
                 await __event_emitter__(self.status("Audio generated", done=True))
             return message_with_download_link(body, voice_name, file_id)
         except ValueError as exc:
@@ -404,9 +355,7 @@ class Action:
         return {"content": message}
 
     @staticmethod
-    async def create_file(
-        filename: str, content: bytes, user: dict, voice_name: str
-    ) -> str | None:
+    async def create_file(filename: str, content: bytes, user: dict) -> str | None:
         try:
             file_id = str(uuid.uuid4())
             contents, path = await asyncio.to_thread(
@@ -419,20 +368,17 @@ class Action:
                         "id": file_id,
                         "filename": filename,
                         "path": path,
-                        # The stock binary-file modal always renders Content.
-                        # Supplying concise explanatory text prevents its otherwise
-                        # confusing "No content" state without pretending an MP3
-                        # has textual source content.
-                        "data": {"content": file_content_summary(voice_name, filename)},
+                        "data": {
+                            "content": (
+                                "Generated audio. Use the Preview tab to listen, "
+                                "or click the filename to download the MP3."
+                            )
+                        },
                         "meta": {
                             "name": filename,
                             "content_type": "audio/mpeg",
                             "size": len(contents),
-                            "data": {
-                                "title": "Generated ElevenLabs Audio",
-                                "source": "elevenlabs_tts_enhanced",
-                                "voice": voice_name,
-                            },
+                            "data": {"title": "Generated ElevenLabs Audio"},
                         },
                     }
                 ),

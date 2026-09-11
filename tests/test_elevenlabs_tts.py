@@ -1,31 +1,14 @@
 import importlib.util
-import sys
-import types
-from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
 
 def load_module():
-    open_webui = types.ModuleType("open_webui")
-    models = types.ModuleType("open_webui.models")
-    files = types.ModuleType("open_webui.models.files")
-    storage = types.ModuleType("open_webui.storage")
-    provider = types.ModuleType("open_webui.storage.provider")
-    files.FileForm = dict
-    files.Files = object
-    provider.Storage = object
-    sys.modules.update(
-        {
-            "open_webui": open_webui,
-            "open_webui.models": models,
-            "open_webui.models.files": files,
-            "open_webui.storage": storage,
-            "open_webui.storage.provider": provider,
-        }
+    path = (
+        Path(__file__).parents[1]
+        / "functions/actions/elevenlabs_tts/main.py"
     )
-    path = Path(__file__).parents[1] / "functions/actions/elevenlabs_tts/main.py"
     spec = importlib.util.spec_from_file_location("elevenlabs_tts", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -35,111 +18,95 @@ def load_module():
 tts = load_module()
 
 
-def test_parses_curated_voices_and_ignores_malformed_lines():
-    voices, descriptions = tts.parse_custom_voices(
-        "Ada:id-a:Warm\ninvalid\n :id-b\nLin:id-l"
-    )
-    assert voices == {"Ada": "id-a", "Lin": "id-l"}
-    assert descriptions == {"Ada": "Warm"}
+def test_embed_is_self_contained_and_has_intentional_player_and_download_controls():
+    rendered = tts.embed_html(b"ID3audio", "episode.mp3", "Ada <Friendly>")
+    assert "SUQzYXVkaW8=" in rendered
+    assert 'id="player" controls' in rendered
+    assert 'id="download"' in rendered
+    assert "Download MP3" in rendered
+    assert "Ada &lt;Friendly&gt;" in rendered
+    assert "/api/v1/files/" not in rendered
+    assert "iframe:height" in rendered
 
 
-def test_markdown_is_cleaned_for_speech_without_link_urls_or_code():
-    result = tts.speech_text(
-        "# Hello\n[Read this](https://example.com)\n```python\nprint('no')\n```\n*Final* <b>words</b>"
-    )
-    assert result == "Hello Read this Final words"
-
-
-def test_multipart_content_is_supported():
-    assert (
-        tts.speech_text(
-            [{"type": "image_url", "image_url": {}}, {"type": "text", "text": "Hello"}]
-        )
-        == "Hello"
-    )
-
-
-def test_model_choice_and_character_limits_match_documented_models():
-    assert tts.model_for_mode("fast") == "eleven_flash_v2_5"
-    assert tts.model_for_mode("QUALITY") == "eleven_multilingual_v2"
-    assert tts.MODEL_CHARACTER_LIMITS["eleven_v3"] == 5000
-    assert tts.MODEL_CHARACTER_LIMITS["eleven_flash_v2_5"] == 40000
-
-
-def test_voice_resolution_is_case_insensitive():
-    assert tts.Action.resolve_voice("jEsSiCa", {"Jessica": "voice-id"}) == (
-        "Jessica",
-        "voice-id",
-    )
-    assert tts.Action.resolve_voice("unknown", {"Jessica": "voice-id"}) is None
-
-
-def test_retry_delay_honors_a_valid_server_hint_and_bounds_invalid_hints(monkeypatch):
-    assert tts.Action.retry_delay(0, "3") == 3.0
-    assert tts.Action.retry_delay(0, "60") == 30.0
-    monkeypatch.setattr(tts.random, "uniform", lambda start, end: end)
-    assert tts.Action.retry_delay(2, "not-a-number") == 2.0
-
-
-def test_file_attachment_uses_openwebui_downloadable_message_shape():
-    attachment = tts.file_attachment("file-1", "tts.mp3", 1234)
-    assert attachment == {
-        "type": "file",
-        "id": "file-1",
-        "url": "/api/v1/files/file-1/content?attachment=true",
-        "name": "tts.mp3",
-        "content_type": "audio/mpeg",
-        "size": 1234,
-    }
-
-
-def test_file_content_url_uses_openwebui_authenticated_route():
-    assert tts.file_content_url("file-1") == "/api/v1/files/file-1/content"
-    assert (
-        tts.file_content_url("file-1", attachment=True)
-        == "/api/v1/files/file-1/content?attachment=true"
-    )
-
-
-def test_message_result_adds_a_visible_download_link_without_overwriting_content():
-    result = tts.message_with_download_link(
+def test_embed_message_preserves_assistant_answer_and_describes_controls():
+    result = tts.message_result(
         {
             "id": "message-1",
             "messages": [
-                {"role": "user", "content": "Read this aloud"},
-                {"role": "assistant", "content": "Here is the response."},
+                {"role": "user", "content": "Narrate this"},
+                {"role": "assistant", "content": "Original answer."},
             ],
         },
         "Donovan",
-        "file-1",
     )
     assert result == {
         "messages": [
             {
                 "id": "message-1",
-                "content": "Here is the response.\n\n[Download audio](/api/v1/files/file-1/content?attachment=true)",
+                "content": "Original answer.\n\nAudio ready with **Donovan**. Use the player and **Download MP3** button in the audio card.",
             }
         ]
     }
 
 
-@pytest.mark.asyncio
-async def test_create_file_uses_current_async_openwebui_file_api(monkeypatch):
-    class Files:
-        @staticmethod
-        async def insert_new_file(user_id, form):
-            assert user_id == "user-1"
-            assert form["meta"]["content_type"] == "audio/mpeg"
-            assert form["data"]["content"].startswith("Generated audio.")
-            return SimpleNamespace(id=form["id"])
+def test_markup_is_cleaned_before_narration():
+    assert tts.speech_text("# Hello\n[guide](https://example.com)\n`thanks`") == "Hello guide thanks"
 
-    monkeypatch.setattr(tts, "Files", Files)
-    monkeypatch.setattr(tts, "FileForm", lambda **data: data)
-    monkeypatch.setattr(
-        tts,
-        "Storage",
-        SimpleNamespace(
-            upload_file=lambda file, filename, tags: (file.read(), f"/tmp/{filename}")
-        ),
+
+@pytest.mark.asyncio
+async def test_action_keeps_iframe_and_emits_main_page_fallback(monkeypatch):
+    action = tts.Action()
+    action.valves.ELEVENLABS_API_KEY = "test-key"
+    action.valves.MAX_EMBED_AUDIO_BYTES = 100_000
+    monkeypatch.setattr(action, "voice_options", lambda: async_value(({"Ada": "voice-id"}, {}))
     )
-    assert await tts.Action.create_file("test.mp3", b"audio", {"id": "user-1"})
+    monkeypatch.setattr(action, "generate_audio", lambda voice_id, text: async_value(b"ID3audio"))
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    async def choose_voice(event):
+        assert event["type"] == "input"
+        return "Ada"
+
+    result = await action.action(
+        {
+            "id": "message-1",
+            "messages": [{"role": "assistant", "content": "A short answer."}],
+        },
+        __event_emitter__=emit,
+        __event_call__=choose_voice,
+    )
+
+    embed_event = next(event for event in events if event["type"] == "embeds")
+    assert embed_event["data"]["replace"] is True
+    assert len(embed_event["data"]["embeds"]) == 1
+    assert "Download MP3" in embed_event["data"]["embeds"][0]
+    execute_event = next(event for event in events if event["type"] == "execute")
+    assert "Download MP3" in execute_event["data"]["code"]
+    assert "createElement('audio')" in execute_event["data"]["code"]
+    assert result["messages"][0]["id"] == "message-1"
+
+
+@pytest.mark.asyncio
+async def test_action_rejects_audio_that_would_bloat_chat_history(monkeypatch):
+    action = tts.Action()
+    action.valves.ELEVENLABS_API_KEY = "test-key"
+    action.valves.MAX_EMBED_AUDIO_BYTES = 100_000
+    monkeypatch.setattr(action, "voice_options", lambda: async_value(({"Ada": "voice-id"}, {}))
+    )
+    monkeypatch.setattr(
+        action, "generate_audio", lambda voice_id, text: async_value(b"x" * 100_001)
+    )
+
+    result = await action.action(
+        {"messages": [{"role": "assistant", "content": "A short answer."}]},
+        __event_call__=lambda event: async_value("Ada"),
+    )
+    assert "embedded-player limit" in result["content"]
+
+
+async def async_value(value):
+    return value

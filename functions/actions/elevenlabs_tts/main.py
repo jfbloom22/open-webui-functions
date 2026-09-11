@@ -1,15 +1,25 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 0.3.6
+version: 1.0.0
 license: MIT
 requirements: aiohttp, pydantic
-description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
+description: Generate speech in a self-contained, persistent player with an explicit MP3 download button.
+"""
+
+"""A function-only alternative to Open WebUI's native file attachment UI.
+
+The audio is embedded as base64 inside Open WebUI's documented ``embeds`` event.
+That makes the player and download control independent of the browser's authenticated
+``/api/v1/files/...`` navigation behaviour. The trade-off is intentionally bounded by
+MAX_EMBED_AUDIO_BYTES: embed payloads live in chat history, so this is for short-form
+narration rather than long podcasts.
 """
 
 import asyncio
+import base64
 import html
-import io
+import json
 import random
 import re
 import uuid
@@ -17,8 +27,6 @@ from typing import Any, Callable, Literal
 
 import aiohttp
 from pydantic import BaseModel, Field
-from open_webui.models.files import FileForm, Files
-from open_webui.storage.provider import Storage
 
 
 API_BASE_URL = "https://api.elevenlabs.io/v1"
@@ -28,7 +36,6 @@ MODEL_CHARACTER_LIMITS = {
     "eleven_v3": 5000,
     QUALITY_MODEL: 10000,
     FAST_MODEL: 40000,
-    "eleven_flash_v2": 30000,
 }
 
 
@@ -50,7 +57,6 @@ def parse_custom_voices(value: str | None) -> tuple[dict[str, str], dict[str, st
 
 
 def text_from_content(content: Any) -> str:
-    """Return text from either a normal or OpenAI-style multipart message."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -63,65 +69,114 @@ def text_from_content(content: Any) -> str:
 
 
 def speech_text(content: Any) -> str:
-    """Make a readable assistant response suitable for narration, not markup recitation."""
+    """Strip presentation markup so the generated speech sounds natural."""
     text = text_from_content(content)
-    text = re.sub(r"```[\s\S]*?```", "", text)  # Code is rarely useful when narrated.
+    text = re.sub(r"```[\s\S]*?```", "", text)
     text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"<https?://[^>]+>", "", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"(?m)^\s{0,3}(?:#{1,6}|>|[-+*]|\d+[.)])\s+", "", text)
     text = re.sub(r"(?<!\w)[*_~`]+|[*_~`]+(?!\w)", "", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
 def model_for_mode(mode: str) -> str:
-    return FAST_MODEL if mode.strip().lower() == "fast" else QUALITY_MODEL
+    return FAST_MODEL if mode.strip().casefold() == "fast" else QUALITY_MODEL
 
 
-def file_content_url(file_id: str, *, attachment: bool = False) -> str:
-    """Return Open WebUI's authenticated file-content route for a stored file."""
-    suffix = "?attachment=true" if attachment else ""
-    return f"/api/v1/files/{file_id}/content{suffix}"
+def embed_html(audio: bytes, filename: str, voice_name: str) -> str:
+    """Build a self-contained player that does not need Open WebUI auth in its iframe.
+
+    An object URL is created inside the sandboxed iframe from the base64 payload. This
+    avoids an iframe request to Open WebUI's protected Files endpoint, which cannot
+    access the parent page's localStorage token by default.
+    """
+    encoded = base64.b64encode(audio).decode("ascii")
+    safe_filename = html.escape(filename, quote=True)
+    safe_voice = html.escape(voice_name)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {{ color-scheme: light dark; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; padding: 12px; font-family: ui-sans-serif, system-ui, sans-serif; }}
+    .card {{ border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 12px; padding: 14px; }}
+    .title {{ font-weight: 700; margin: 0 0 3px; }}
+    .meta {{ margin: 0 0 12px; opacity: .72; font-size: .88rem; }}
+    audio {{ display: block; width: 100%; margin-bottom: 12px; }}
+    .download {{ display: inline-block; padding: 8px 12px; border-radius: 8px; background: #2563eb; color: white; font-weight: 650; text-decoration: none; }}
+    .hint {{ margin: 9px 0 0; opacity: .68; font-size: .78rem; }}
+  </style>
+</head>
+<body>
+  <section class="card" aria-label="Generated ElevenLabs audio">
+    <p class="title">Audio ready</p>
+    <p class="meta">Voice: {safe_voice} · MP3</p>
+    <audio id="player" controls preload="metadata">Your browser does not support audio playback.</audio>
+    <a id="download" class="download" download="{safe_filename}" href="#">Download MP3</a>
+    <p class="hint">Preview above, then use Download MP3 to save a copy.</p>
+  </section>
+  <script>
+    (() => {{
+      const base64Audio = '{encoded}';
+      const binary = atob(base64Audio);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+      const url = URL.createObjectURL(new Blob([bytes], {{ type: 'audio/mpeg' }}));
+      document.getElementById('player').src = url;
+      document.getElementById('download').href = url;
+      const reportHeight = () => parent.postMessage({{ type: 'iframe:height', height: document.documentElement.scrollHeight }}, '*');
+      window.addEventListener('load', reportHeight);
+      new ResizeObserver(reportHeight).observe(document.body);
+      window.addEventListener('beforeunload', () => URL.revokeObjectURL(url));
+    }})();
+  </script>
+</body>
+</html>"""
 
 
-def file_attachment(file_id: str, filename: str, size: int) -> dict[str, Any]:
-    """Shape a generated file for Open WebUI's native file event."""
-    return {
-        "type": "file",
-        "id": file_id,
-        "url": file_content_url(file_id, attachment=True),
-        "name": filename,
-        "content_type": "audio/mpeg",
-        "size": size,
-    }
+def download_panel_script(audio: bytes, filename: str, voice_name: str) -> str:
+    """Build a player and download control in the trusted main page, not an iframe."""
+    encoded = base64.b64encode(audio).decode("ascii")
+    return f"""(() => {{
+      const existing = document.getElementById('wl-tts-download-panel'); if (existing) {{ existing.__wlCleanup?.(); existing.remove(); }}
+      const data = {json.dumps(encoded)}; const filename = {json.dumps(filename)};
+      const panel = document.createElement('div'); panel.id = 'wl-tts-download-panel';
+      panel.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483647;background:#171717;color:#fff;border:1px solid #555;border-radius:12px;padding:14px 16px;box-shadow:0 8px 30px #0008;font:14px system-ui,sans-serif;width:min(420px,calc(100vw - 40px))';
+      const heading = document.createElement('div'); heading.textContent = 'Audio ready (' + {json.dumps(voice_name)} + ')'; heading.style.cssText = 'font-weight:700;margin-bottom:10px';
+      const binary = atob(data); const bytes = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], {{type:'audio/mpeg'}}));
+      panel.__wlCleanup = () => URL.revokeObjectURL(url);
+      const player = document.createElement('audio'); player.controls = true; player.preload = 'metadata'; player.src = url; player.style.cssText = 'display:block;width:100%;margin-bottom:10px';
+      const button = document.createElement('button'); button.textContent = 'Download MP3';
+      button.style.cssText = 'border:0;border-radius:8px;padding:8px 12px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer';
+      button.onclick = () => {{ const link = document.createElement('a'); link.href = url; link.download = filename;
+        document.body.appendChild(link); link.click(); link.remove(); }};
+      const close = document.createElement('button'); close.textContent = '×'; close.setAttribute('aria-label', 'Close'); close.style.cssText = 'border:0;background:transparent;color:#aaa;font-size:20px;cursor:pointer'; close.onclick = () => {{ panel.__wlCleanup?.(); panel.remove(); }};
+      panel.append(heading, player, button, close); document.body.appendChild(panel);
+      window.addEventListener('beforeunload', () => URL.revokeObjectURL(url), {{once:true}});
+    }})()"""
 
 
-def message_with_download_link(body: dict, voice_name: str, file_id: str) -> dict[str, Any]:
-    """Update the action message with a visible, authenticated download link."""
-    messages = body.get("messages", [])
+def message_result(body: dict, voice_name: str) -> dict[str, Any]:
+    """Preserve the answer while explaining where the intentional controls live."""
     current = next(
         (
             message.get("content", "")
-            for message in reversed(messages)
+            for message in reversed(body.get("messages", []))
             if message.get("role") == "assistant"
         ),
         "",
-    )
-    link = f"[Download audio]({file_content_url(file_id, attachment=True)})"
-    content = current.rstrip()
-    if link not in content:
-        content = f"{content}\n\n{link}" if content else link
-    message_id = body.get("id")
-    if message_id:
-        return {"messages": [{"id": message_id, "content": content}]}
-    return {
-        "content": (
-            f"Audio generated with ElevenLabs voice **{voice_name}**. "
-            f"{link}"
-        )
-    }
+    ).rstrip()
+    notice = f"Audio ready with **{voice_name}**. Use the player and **Download MP3** button in the audio card."
+    content = f"{current}\n\n{notice}" if current else notice
+    if body.get("id"):
+        return {"messages": [{"id": body["id"], "content": content}]}
+    return {"content": notice}
 
 
 class Action:
@@ -129,30 +184,22 @@ class Action:
         ELEVENLABS_API_KEY: str = Field(default="", description="ElevenLabs API key.")
         PLAYBACK_MODE: Literal["quality", "fast"] = Field(
             default="quality",
-            description="quality uses Multilingual v2 for reliable narration; fast uses Flash v2.5 for lower latency.",
+            description="quality uses Multilingual v2; fast uses Flash v2.5.",
         )
-        DEFAULT_VOICE: str = Field(
-            default="Donovan", description="Default curated voice name."
-        )
+        DEFAULT_VOICE: str = Field(default="Donovan", description="Default curated voice.")
         CUSTOM_VOICES: str = Field(
             default="Donovan:DMyrgzQFny3JI1Y1paM5:Articulate, strong, and deep\nJessica:g6xIsTj2HwM6VR4iXFCw:Friendly and conversational\nMark:1SM7GgM6IMuvQlz2BwM3:Conversational\nArcher:Fahco4VZzobUeiPqni1S:Conversational\nBrittney:kPzsL2i3teMYv0FxEYQ6:Fun, youthful, and informal",
             description="One curated voice per line: Name:VoiceID:optional description.",
         )
-        MAX_CHARACTERS: int = Field(
-            default=9000,
-            ge=100,
-            le=40000,
-            description="Maximum speech-ready characters per request.",
+        MAX_CHARACTERS: int = Field(default=2200, ge=100, le=10000)
+        MAX_EMBED_AUDIO_BYTES: int = Field(
+            default=2_500_000,
+            ge=100_000,
+            le=10_000_000,
+            description="Largest MP3 stored directly in chat history. Keep this small for responsive chats.",
         )
-        REQUEST_TIMEOUT_SECONDS: int = Field(
-            default=90, ge=10, le=300, description="Request timeout."
-        )
-        RETRY_ATTEMPTS: int = Field(
-            default=2,
-            ge=0,
-            le=4,
-            description="Retries for rate-limit and server errors.",
-        )
+        REQUEST_TIMEOUT_SECONDS: int = Field(default=90, ge=10, le=300)
+        RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=4)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -164,23 +211,26 @@ class Action:
     def selected_model(self) -> str:
         return model_for_mode(self.valves.PLAYBACK_MODE)
 
+    @staticmethod
+    def resolve_voice(name: str, voices: dict[str, str]) -> tuple[str, str] | None:
+        for candidate, voice_id in voices.items():
+            if candidate.casefold() == name.strip().casefold():
+                return candidate, voice_id
+        return None
+
     async def voice_options(self) -> tuple[dict[str, str], dict[str, str]]:
         voices, descriptions = parse_custom_voices(self.valves.CUSTOM_VOICES)
         if voices:
             return voices, descriptions
-        headers = {"xi-api-key": self.valves.ELEVENLABS_API_KEY}
         timeout = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                f"{API_BASE_URL}/voices", headers=headers
+                f"{API_BASE_URL}/voices", headers={"xi-api-key": self.valves.ELEVENLABS_API_KEY}
             ) as response:
                 if response.status >= 400:
                     raise ValueError(await self.api_error(response, "load voices"))
                 data = await response.json()
-        return (
-            {voice["name"]: voice["voice_id"] for voice in data.get("voices", [])},
-            {},
-        )
+        return {voice["name"]: voice["voice_id"] for voice in data.get("voices", [])}, {}
 
     @staticmethod
     async def api_error(response: aiohttp.ClientResponse, operation: str) -> str:
@@ -192,15 +242,7 @@ class Action:
         return f"ElevenLabs could not {operation} (HTTP {response.status}): {detail}"
 
     @staticmethod
-    def resolve_voice(name: str, voices: dict[str, str]) -> tuple[str, str] | None:
-        for candidate, voice_id in voices.items():
-            if candidate.casefold() == name.strip().casefold():
-                return candidate, voice_id
-        return None
-
-    @staticmethod
     def retry_delay(attempt: int, retry_after: str | None) -> float:
-        """Respect a server retry hint, otherwise use capped exponential full jitter."""
         if retry_after:
             try:
                 return min(30.0, max(0.0, float(retry_after)))
@@ -209,23 +251,18 @@ class Action:
         return random.uniform(0, min(8.0, 0.5 * (2**attempt)))
 
     async def generate_audio(self, voice_id: str, text: str) -> bytes:
-        model_id = self.selected_model()
+        headers = {"xi-api-key": self.valves.ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload = {
             "text": text,
-            "model_id": model_id,
+            "model_id": self.selected_model(),
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
         }
-        headers = {
-            "xi-api-key": self.valves.ELEVENLABS_API_KEY,
-            "Content-Type": "application/json",
-        }
         timeout = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
-        url = f"{API_BASE_URL}/text-to-speech/{voice_id}"
         for attempt in range(self.valves.RETRY_ATTEMPTS + 1):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(
-                        url,
+                        f"{API_BASE_URL}/text-to-speech/{voice_id}",
                         params={"output_format": "mp3_44100_128"},
                         json=payload,
                         headers=headers,
@@ -253,136 +290,59 @@ class Action:
     ) -> dict[str, Any]:
         try:
             if not self.valves.ELEVENLABS_API_KEY.strip():
-                raise ValueError(
-                    "ElevenLabs API key is not configured in the function settings."
-                )
-            if not __user__.get("id"):
-                raise ValueError(
-                    "You must be signed in to generate a private audio file."
-                )
+                raise ValueError("ElevenLabs API key is not configured in the function settings.")
             if not __event_call__:
-                raise ValueError(
-                    "This Open WebUI client does not support the voice-selection dialog."
-                )
+                raise ValueError("This Open WebUI client does not support the voice-selection dialog.")
             raw_message = next(
-                (
-                    m.get("content")
-                    for m in reversed(body.get("messages", []))
-                    if m.get("role") == "assistant"
-                ),
+                (m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "assistant"),
                 None,
             )
             text = speech_text(raw_message)
             if not text:
                 raise ValueError("The latest assistant reply has no narratable text.")
-            model_limit = MODEL_CHARACTER_LIMITS.get(
-                self.selected_model(), self.valves.MAX_CHARACTERS
-            )
+            model_limit = MODEL_CHARACTER_LIMITS.get(self.selected_model(), self.valves.MAX_CHARACTERS)
             limit = min(self.valves.MAX_CHARACTERS, model_limit)
             if len(text) > limit:
-                raise ValueError(
-                    f"This reply is {len(text):,} characters after cleanup; the configured limit is {limit:,}."
-                )
+                raise ValueError(f"This reply is {len(text):,} characters after cleanup; this player supports {limit:,}.")
             if __event_emitter__:
                 await __event_emitter__(self.status("Preparing speech"))
             voices, descriptions = await self.voice_options()
-            if not voices:
-                raise ValueError(
-                    "No ElevenLabs voices are available. Add curated voices in function settings."
-                )
             default = self.resolve_voice(self.valves.DEFAULT_VOICE, voices)
-            default_name = default[0] if default else next(iter(voices))
+            default_name = default[0] if default else next(iter(voices), "")
+            if not default_name:
+                raise ValueError("No ElevenLabs voices are configured.")
             choices = "\n".join(
-                f"• **{name}**"
-                + (f" — {descriptions[name]}" if name in descriptions else "")
+                f"• **{name}**" + (f" — {descriptions[name]}" if name in descriptions else "")
                 for name in voices
             )
             response = await __event_call__(
-                {
-                    "type": "input",
-                    "data": {
-                        "title": "Select ElevenLabs voice",
-                        "message": f"Choose a listed voice name:\n\n{choices}",
-                        "placeholder": "Voice name",
-                        "value": default_name,
-                    },
-                }
+                {"type": "input", "data": {"title": "Select ElevenLabs voice", "message": f"Choose a listed voice name:\n\n{choices}", "placeholder": "Voice name", "value": default_name}}
             )
-            selected = (
-                response
-                if isinstance(response, str)
-                else (response or {}).get("message", "")
-            )
+            selected = response if isinstance(response, str) else (response or {}).get("message", "")
             resolved = self.resolve_voice(str(selected), voices)
             if not resolved:
-                raise ValueError(
-                    "Voice selection was cancelled or does not match a curated voice."
-                )
+                raise ValueError("Voice selection was cancelled or does not match a curated voice.")
             voice_name, voice_id = resolved
             if __event_emitter__:
-                await __event_emitter__(
-                    self.status(
-                        f"Generating {self.valves.PLAYBACK_MODE.lower()} speech with {voice_name}"
-                    )
-                )
+                await __event_emitter__(self.status(f"Generating speech with {voice_name}"))
             audio = await self.generate_audio(voice_id, text)
-            filename = f"tts_{uuid.uuid4()}.mp3"
-            file_id = await self.create_file(filename, audio, __user__)
-            if not file_id:
+            if len(audio) > self.valves.MAX_EMBED_AUDIO_BYTES:
                 raise ValueError(
-                    "Audio was generated but could not be saved to your private files."
+                    f"This MP3 is {len(audio) / 1_000_000:.1f} MB, above this variant's {self.valves.MAX_EMBED_AUDIO_BYTES / 1_000_000:.1f} MB embedded-player limit. Try a shorter response or another audio action."
                 )
+            filename = f"tts_{uuid.uuid4()}.mp3"
             if __event_emitter__:
                 await __event_emitter__(
-                    {
-                        "type": "files",
-                        "data": {
-                            "files": [file_attachment(file_id, filename, len(audio))]
-                        },
-                    }
+                    {"type": "embeds", "data": {"embeds": [embed_html(audio, filename, voice_name)], "replace": True}}
                 )
-                await __event_emitter__(self.status("Audio generated", done=True))
-            return message_with_download_link(body, voice_name, file_id)
+                await __event_emitter__({"type": "execute", "data": {"code": download_panel_script(audio, filename, voice_name)}})
+                await __event_emitter__(self.status("Audio ready", done=True))
+            return message_result(body, voice_name)
         except ValueError as exc:
             message = str(exc)
         except Exception:
             message = "Audio generation failed unexpectedly. Please try again or contact an administrator."
         if __event_emitter__:
             await __event_emitter__(self.status("Audio generation failed", done=True))
-            await __event_emitter__(
-                {"type": "notification", "data": {"type": "error", "content": message}}
-            )
+            await __event_emitter__({"type": "notification", "data": {"type": "error", "content": message}})
         return {"content": message}
-
-    @staticmethod
-    async def create_file(filename: str, content: bytes, user: dict) -> str | None:
-        try:
-            file_id = str(uuid.uuid4())
-            contents, path = await asyncio.to_thread(
-                Storage.upload_file, io.BytesIO(content), f"{file_id}_{filename}", {}
-            )
-            item = await Files.insert_new_file(
-                user["id"],
-                FileForm(
-                    **{
-                        "id": file_id,
-                        "filename": filename,
-                        "path": path,
-                        "data": {
-                            "content": (
-                                "Generated audio. Use the Preview tab to listen, "
-                                "or click the filename to download the MP3."
-                            )
-                        },
-                        "meta": {
-                            "name": filename,
-                            "content_type": "audio/mpeg",
-                            "size": len(contents),
-                            "data": {"title": "Generated ElevenLabs Audio"},
-                        },
-                    }
-                ),
-            )
-            return item.id
-        except Exception:
-            return None
