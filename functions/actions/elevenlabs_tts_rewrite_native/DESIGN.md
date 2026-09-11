@@ -29,3 +29,7 @@ public URLs, or security workarounds.
 The implementation is a clean rewrite rather than a wrapper around the
 existing action. Its small helper boundaries make the event and file contracts
 testable without an Open WebUI runtime.
+
+The current version also emits Open WebUI's documented `execute` event to place
+a visible **Download MP3** control in the main page context. The native file
+remains the durable Preview fallback.

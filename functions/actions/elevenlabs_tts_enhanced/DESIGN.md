@@ -36,3 +36,7 @@ Content tab useful.
   message.
 - The stored file uses `FileForm`, `Files.insert_new_file`, and
   `Storage.upload_file`, matching current Open WebUI server APIs.
+
+The current version also emits a main-page `execute` event with a visible
+Download MP3 button, so users do not have to discover the filename-click
+behavior.
