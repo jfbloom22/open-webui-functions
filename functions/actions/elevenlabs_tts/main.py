@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 0.3.1
+version: 0.3.2
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
@@ -10,9 +10,10 @@ description: Generate private, downloadable speech from the latest assistant rep
 import asyncio
 import html
 import io
+import random
 import re
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -54,7 +55,8 @@ def text_from_content(content: Any) -> str:
         return content
     if isinstance(content, list):
         return "\n".join(
-            item.get("text", "") for item in content
+            item.get("text", "")
+            for item in content
             if isinstance(item, dict) and item.get("type") in {"text", "input_text"}
         )
     return ""
@@ -93,19 +95,32 @@ def file_attachment(file_id: str, filename: str, size: int) -> dict[str, Any]:
 class Action:
     class Valves(BaseModel):
         ELEVENLABS_API_KEY: str = Field(default="", description="ElevenLabs API key.")
-        PLAYBACK_MODE: str = Field(
+        PLAYBACK_MODE: Literal["quality", "fast"] = Field(
             default="quality",
             description="quality uses Multilingual v2 for reliable narration; fast uses Flash v2.5 for lower latency.",
         )
-        DEFAULT_VOICE: str = Field(default="Donovan", description="Default curated voice name.")
+        DEFAULT_VOICE: str = Field(
+            default="Donovan", description="Default curated voice name."
+        )
         CUSTOM_VOICES: str = Field(
             default="Donovan:DMyrgzQFny3JI1Y1paM5:Articulate, strong, and deep\nJessica:g6xIsTj2HwM6VR4iXFCw:Friendly and conversational\nMark:1SM7GgM6IMuvQlz2BwM3:Conversational\nArcher:Fahco4VZzobUeiPqni1S:Conversational\nBrittney:kPzsL2i3teMYv0FxEYQ6:Fun, youthful, and informal",
             description="One curated voice per line: Name:VoiceID:optional description.",
         )
-        OUTPUT_FORMAT: str = Field(default="mp3_44100_128", description="ElevenLabs output format.")
-        MAX_CHARACTERS: int = Field(default=9000, ge=100, le=40000, description="Maximum speech-ready characters per request.")
-        REQUEST_TIMEOUT_SECONDS: int = Field(default=90, ge=10, le=300, description="Request timeout.")
-        RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=4, description="Retries for rate-limit and server errors.")
+        MAX_CHARACTERS: int = Field(
+            default=9000,
+            ge=100,
+            le=40000,
+            description="Maximum speech-ready characters per request.",
+        )
+        REQUEST_TIMEOUT_SECONDS: int = Field(
+            default=90, ge=10, le=300, description="Request timeout."
+        )
+        RETRY_ATTEMPTS: int = Field(
+            default=2,
+            ge=0,
+            le=4,
+            description="Retries for rate-limit and server errors.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -124,11 +139,16 @@ class Action:
         headers = {"xi-api-key": self.valves.ELEVENLABS_API_KEY}
         timeout = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(f"{API_BASE_URL}/voices", headers=headers) as response:
+            async with session.get(
+                f"{API_BASE_URL}/voices", headers=headers
+            ) as response:
                 if response.status >= 400:
                     raise ValueError(await self.api_error(response, "load voices"))
                 data = await response.json()
-        return ({voice["name"]: voice["voice_id"] for voice in data.get("voices", [])}, {})
+        return (
+            {voice["name"]: voice["voice_id"] for voice in data.get("voices", [])},
+            {},
+        )
 
     @staticmethod
     async def api_error(response: aiohttp.ClientResponse, operation: str) -> str:
@@ -146,89 +166,162 @@ class Action:
                 return candidate, voice_id
         return None
 
+    @staticmethod
+    def retry_delay(attempt: int, retry_after: str | None) -> float:
+        """Respect a server retry hint, otherwise use capped exponential full jitter."""
+        if retry_after:
+            try:
+                return min(30.0, max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+        return random.uniform(0, min(8.0, 0.5 * (2**attempt)))
+
     async def generate_audio(self, voice_id: str, text: str) -> bytes:
         model_id = self.selected_model()
         payload = {
             "text": text,
             "model_id": model_id,
-            "output_format": self.valves.OUTPUT_FORMAT,
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
         }
-        headers = {"xi-api-key": self.valves.ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        headers = {
+            "xi-api-key": self.valves.ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+        }
         timeout = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
         url = f"{API_BASE_URL}/text-to-speech/{voice_id}"
         for attempt in range(self.valves.RETRY_ATTEMPTS + 1):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(url, json=payload, headers=headers) as response:
+                    async with session.post(
+                        url,
+                        params={"output_format": "mp3_44100_128"},
+                        json=payload,
+                        headers=headers,
+                    ) as response:
                         if response.status < 400:
                             return await response.read()
                         error = await self.api_error(response, "generate speech")
                         retryable = response.status == 429 or response.status >= 500
+                        retry_after = response.headers.get("Retry-After")
                 if not retryable or attempt == self.valves.RETRY_ATTEMPTS:
                     raise ValueError(error)
             except aiohttp.ClientError as exc:
                 if attempt == self.valves.RETRY_ATTEMPTS:
                     raise ValueError(f"ElevenLabs connection failed: {exc}") from exc
-            await asyncio.sleep(min(4, 0.5 * (2**attempt)))
+                retry_after = None
+            await asyncio.sleep(self.retry_delay(attempt, retry_after))
         raise ValueError("ElevenLabs could not generate speech.")
 
-    async def action(self, body: dict, __user__: dict = {}, __event_emitter__: Callable | None = None, __event_call__: Callable | None = None) -> dict[str, Any]:
+    async def action(
+        self,
+        body: dict,
+        __user__: dict = {},
+        __event_emitter__: Callable | None = None,
+        __event_call__: Callable | None = None,
+    ) -> dict[str, Any]:
         try:
             if not self.valves.ELEVENLABS_API_KEY.strip():
-                raise ValueError("ElevenLabs API key is not configured in the function settings.")
+                raise ValueError(
+                    "ElevenLabs API key is not configured in the function settings."
+                )
             if not __user__.get("id"):
-                raise ValueError("You must be signed in to generate a private audio file.")
+                raise ValueError(
+                    "You must be signed in to generate a private audio file."
+                )
             if not __event_call__:
-                raise ValueError("This Open WebUI client does not support the voice-selection dialog.")
-            raw_message = next((m.get("content") for m in reversed(body.get("messages", [])) if m.get("role") == "assistant"), None)
+                raise ValueError(
+                    "This Open WebUI client does not support the voice-selection dialog."
+                )
+            raw_message = next(
+                (
+                    m.get("content")
+                    for m in reversed(body.get("messages", []))
+                    if m.get("role") == "assistant"
+                ),
+                None,
+            )
             text = speech_text(raw_message)
             if not text:
                 raise ValueError("The latest assistant reply has no narratable text.")
-            model_limit = MODEL_CHARACTER_LIMITS.get(self.selected_model(), self.valves.MAX_CHARACTERS)
+            model_limit = MODEL_CHARACTER_LIMITS.get(
+                self.selected_model(), self.valves.MAX_CHARACTERS
+            )
             limit = min(self.valves.MAX_CHARACTERS, model_limit)
             if len(text) > limit:
-                raise ValueError(f"This reply is {len(text):,} characters after cleanup; the configured limit is {limit:,}.")
+                raise ValueError(
+                    f"This reply is {len(text):,} characters after cleanup; the configured limit is {limit:,}."
+                )
             if __event_emitter__:
                 await __event_emitter__(self.status("Preparing speech"))
             voices, descriptions = await self.voice_options()
             if not voices:
-                raise ValueError("No ElevenLabs voices are available. Add curated voices in function settings.")
+                raise ValueError(
+                    "No ElevenLabs voices are available. Add curated voices in function settings."
+                )
             default = self.resolve_voice(self.valves.DEFAULT_VOICE, voices)
             default_name = default[0] if default else next(iter(voices))
-            choices = "\n".join(f"• **{name}**" + (f" — {descriptions[name]}" if name in descriptions else "") for name in voices)
-            response = await __event_call__({"type": "input", "data": {"title": "Select ElevenLabs voice", "message": f"Choose a listed voice name:\n\n{choices}", "placeholder": "Voice name", "value": default_name}})
-            selected = response if isinstance(response, str) else (response or {}).get("message", "")
+            choices = "\n".join(
+                f"• **{name}**"
+                + (f" — {descriptions[name]}" if name in descriptions else "")
+                for name in voices
+            )
+            response = await __event_call__(
+                {
+                    "type": "input",
+                    "data": {
+                        "title": "Select ElevenLabs voice",
+                        "message": f"Choose a listed voice name:\n\n{choices}",
+                        "placeholder": "Voice name",
+                        "value": default_name,
+                    },
+                }
+            )
+            selected = (
+                response
+                if isinstance(response, str)
+                else (response or {}).get("message", "")
+            )
             resolved = self.resolve_voice(str(selected), voices)
             if not resolved:
-                raise ValueError("Voice selection was cancelled or does not match a curated voice.")
+                raise ValueError(
+                    "Voice selection was cancelled or does not match a curated voice."
+                )
             voice_name, voice_id = resolved
             if __event_emitter__:
-                await __event_emitter__(self.status(f"Generating {self.valves.PLAYBACK_MODE.lower()} speech with {voice_name}"))
+                await __event_emitter__(
+                    self.status(
+                        f"Generating {self.valves.PLAYBACK_MODE.lower()} speech with {voice_name}"
+                    )
+                )
             audio = await self.generate_audio(voice_id, text)
             filename = f"tts_{uuid.uuid4()}.mp3"
             file_id = await self.create_file(filename, audio, __user__)
             if not file_id:
-                raise ValueError("Audio was generated but could not be saved to your private files.")
+                raise ValueError(
+                    "Audio was generated but could not be saved to your private files."
+                )
             if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "chat:message:files",
-                        "data": {"files": [file_attachment(file_id, filename, len(audio))]},
+                        "data": {
+                            "files": [file_attachment(file_id, filename, len(audio))]
+                        },
                     }
                 )
                 await __event_emitter__(self.status("Audio generated", done=True))
-                await __event_emitter__(
-                    {"type": "message", "data": {"content": "Your downloadable MP3 is attached above."}}
-                )
-            return {"content": f"Audio generated with ElevenLabs voice **{voice_name}**. The MP3 is attached to this message."}
+            return {
+                "content": f"Audio generated with ElevenLabs voice **{voice_name}**. The MP3 is attached to this message."
+            }
         except ValueError as exc:
             message = str(exc)
         except Exception:
             message = "Audio generation failed unexpectedly. Please try again or contact an administrator."
         if __event_emitter__:
             await __event_emitter__(self.status("Audio generation failed", done=True))
-            await __event_emitter__({"type": "notification", "data": {"type": "error", "content": message}})
+            await __event_emitter__(
+                {"type": "notification", "data": {"type": "error", "content": message}}
+            )
         return {"content": message}
 
     @staticmethod

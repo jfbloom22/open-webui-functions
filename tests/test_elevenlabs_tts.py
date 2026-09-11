@@ -16,7 +16,15 @@ def load_module():
     files.FileForm = dict
     files.Files = object
     provider.Storage = object
-    sys.modules.update({"open_webui": open_webui, "open_webui.models": models, "open_webui.models.files": files, "open_webui.storage": storage, "open_webui.storage.provider": provider})
+    sys.modules.update(
+        {
+            "open_webui": open_webui,
+            "open_webui.models": models,
+            "open_webui.models.files": files,
+            "open_webui.storage": storage,
+            "open_webui.storage.provider": provider,
+        }
+    )
     path = Path(__file__).parents[1] / "functions/actions/elevenlabs_tts/main.py"
     spec = importlib.util.spec_from_file_location("elevenlabs_tts", path)
     module = importlib.util.module_from_spec(spec)
@@ -28,18 +36,27 @@ tts = load_module()
 
 
 def test_parses_curated_voices_and_ignores_malformed_lines():
-    voices, descriptions = tts.parse_custom_voices("Ada:id-a:Warm\ninvalid\n :id-b\nLin:id-l")
+    voices, descriptions = tts.parse_custom_voices(
+        "Ada:id-a:Warm\ninvalid\n :id-b\nLin:id-l"
+    )
     assert voices == {"Ada": "id-a", "Lin": "id-l"}
     assert descriptions == {"Ada": "Warm"}
 
 
 def test_markdown_is_cleaned_for_speech_without_link_urls_or_code():
-    result = tts.speech_text("# Hello\n[Read this](https://example.com)\n```python\nprint('no')\n```\n*Final* <b>words</b>")
+    result = tts.speech_text(
+        "# Hello\n[Read this](https://example.com)\n```python\nprint('no')\n```\n*Final* <b>words</b>"
+    )
     assert result == "Hello Read this Final words"
 
 
 def test_multipart_content_is_supported():
-    assert tts.speech_text([{"type": "image_url", "image_url": {}}, {"type": "text", "text": "Hello"}]) == "Hello"
+    assert (
+        tts.speech_text(
+            [{"type": "image_url", "image_url": {}}, {"type": "text", "text": "Hello"}]
+        )
+        == "Hello"
+    )
 
 
 def test_model_choice_and_character_limits_match_documented_models():
@@ -50,8 +67,18 @@ def test_model_choice_and_character_limits_match_documented_models():
 
 
 def test_voice_resolution_is_case_insensitive():
-    assert tts.Action.resolve_voice("jEsSiCa", {"Jessica": "voice-id"}) == ("Jessica", "voice-id")
+    assert tts.Action.resolve_voice("jEsSiCa", {"Jessica": "voice-id"}) == (
+        "Jessica",
+        "voice-id",
+    )
     assert tts.Action.resolve_voice("unknown", {"Jessica": "voice-id"}) is None
+
+
+def test_retry_delay_honors_a_valid_server_hint_and_bounds_invalid_hints(monkeypatch):
+    assert tts.Action.retry_delay(0, "3") == 3.0
+    assert tts.Action.retry_delay(0, "60") == 30.0
+    monkeypatch.setattr(tts.random, "uniform", lambda start, end: end)
+    assert tts.Action.retry_delay(2, "not-a-number") == 2.0
 
 
 def test_file_attachment_uses_openwebui_downloadable_message_shape():
@@ -80,6 +107,8 @@ async def test_create_file_uses_current_async_openwebui_file_api(monkeypatch):
     monkeypatch.setattr(
         tts,
         "Storage",
-        SimpleNamespace(upload_file=lambda file, filename, tags: (file.read(), f"/tmp/{filename}")),
+        SimpleNamespace(
+            upload_file=lambda file, filename, tags: (file.read(), f"/tmp/{filename}")
+        ),
     )
     assert await tts.Action.create_file("test.mp3", b"audio", {"id": "user-1"})
