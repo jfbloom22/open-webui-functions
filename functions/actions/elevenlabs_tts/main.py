@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 1.1.0
+version: 1.2.0
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate speech and attach a native Open WebUI audio file with preview and download support.
@@ -82,6 +82,36 @@ def speech_text(content: Any) -> str:
 
 def model_for_mode(mode: str) -> str:
     return FAST_MODEL if mode.strip().casefold() == "fast" else QUALITY_MODEL
+
+
+def split_speech_text(text: str, max_characters: int) -> list[str]:
+    """Split long narration at sentence boundaries within a provider limit."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if len(sentence) > max_characters:
+            if current:
+                chunks.append(current)
+                current = ""
+            while len(sentence) > max_characters:
+                split_at = sentence.rfind(" ", 0, max_characters + 1)
+                split_at = split_at if split_at > 0 else max_characters
+                chunks.append(sentence[:split_at].strip())
+                sentence = sentence[split_at:].strip()
+            if sentence:
+                current = sentence
+        elif current and len(current) + 1 + len(sentence) <= max_characters:
+            current = f"{current} {sentence}"
+        else:
+            if current:
+                chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks or [text.strip()]
 
 
 def filename_voice_part(voice_name: str) -> str:
@@ -180,7 +210,12 @@ class Action:
             default="Donovan:DMyrgzQFny3JI1Y1paM5:Articulate, strong, and deep\nJessica:g6xIsTj2HwM6VR4iXFCw:Friendly and conversational\nMark:1SM7GgM6IMuvQlz2BwM3:Conversational\nArcher:Fahco4VZzobUeiPqni1S:Conversational\nBrittney:kPzsL2i3teMYv0FxEYQ6:Fun, youthful, and informal",
             description="One curated voice per line: Name:VoiceID:optional description.",
         )
-        MAX_CHARACTERS: int = Field(default=2200, ge=100, le=10000)
+        MAX_CHARACTERS: int = Field(
+            default=60_000,
+            ge=100,
+            le=100_000,
+            description="Largest total narration input. Long replies are split into provider-sized requests.",
+        )
         REQUEST_TIMEOUT_SECONDS: int = Field(default=90, ge=10, le=300)
         RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=4)
 
@@ -285,9 +320,11 @@ class Action:
             if not text:
                 raise ValueError("The latest assistant reply has no narratable text.")
             model_limit = MODEL_CHARACTER_LIMITS.get(self.selected_model(), self.valves.MAX_CHARACTERS)
-            limit = min(self.valves.MAX_CHARACTERS, model_limit)
-            if len(text) > limit:
-                raise ValueError(f"This reply is {len(text):,} characters after cleanup; this player supports {limit:,}.")
+            if len(text) > self.valves.MAX_CHARACTERS:
+                raise ValueError(
+                    f"This reply is {len(text):,} characters after cleanup; this action supports {self.valves.MAX_CHARACTERS:,}."
+                )
+            text_chunks = split_speech_text(text, model_limit)
             if __event_emitter__:
                 await __event_emitter__(self.status("Preparing speech"))
             voices, descriptions = await self.voice_options()
@@ -307,9 +344,13 @@ class Action:
             if not resolved:
                 raise ValueError("Voice selection was cancelled or does not match a curated voice.")
             voice_name, voice_id = resolved
-            if __event_emitter__:
-                await __event_emitter__(self.status(f"Generating speech with {voice_name}"))
-            audio = await self.generate_audio(voice_id, text)
+            audio_parts: list[bytes] = []
+            for index, text_chunk in enumerate(text_chunks, start=1):
+                if __event_emitter__:
+                    suffix = f" ({index}/{len(text_chunks)})" if len(text_chunks) > 1 else ""
+                    await __event_emitter__(self.status(f"Generating speech with {voice_name}{suffix}"))
+                audio_parts.append(await self.generate_audio(voice_id, text_chunk))
+            audio = b"".join(audio_parts)
             filename = (
                 f"Podcast audio - {filename_voice_part(voice_name)} - "
                 f"{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M%S')} - {uuid.uuid4().hex[:8]}.mp3"

@@ -48,6 +48,11 @@ def test_voice_filename_part_is_safe_and_friendly():
     assert tts.filename_voice_part("...") == "voice"
 
 
+def test_long_narration_is_split_at_sentence_boundaries():
+    chunks = tts.split_speech_text("One two. Three four! Five six?", 12)
+    assert chunks == ["One two.", "Three four!", "Five six?"]
+
+
 @pytest.mark.asyncio
 async def test_action_attaches_one_native_audio_file(monkeypatch):
     action = tts.Action()
