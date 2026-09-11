@@ -2,32 +2,38 @@
 
 ## Approach
 
-This is a complete function-only alternative to Open WebUI's file modal. It emits the documented, persistent `embeds` event containing an HTML audio card. The card has the native browser player first and a visibly labeled **Download MP3** button second, so there is no empty `Content` tab or filename-click discovery problem.
-
-The MP3 is base64-encoded in the saved iframe HTML. JavaScript turns it into a `Blob` object URL inside the sandboxed iframe, then supplies that URL to both the player and a download anchor. No request to `/api/v1/files/{id}/content` is required.
+The action uses Open WebUI's documented `files` event and Files API. It uploads
+the generated MP3 to the configured storage provider, adds a short explanatory
+note as the file's text content, and attaches a normal `audio/mpeg` file record
+to the assistant message.
 
 ## Why this is meaningfully different
 
-Open WebUI's file route relies on an Authorization header from the parent app's local storage. A normal navigation, Markdown link, or default sandboxed iframe cannot provide that header. Rich UI embeds are persisted and receive `allow-scripts` and `allow-downloads`, making self-contained audio the only function-only embed design that does not depend on parent authentication state.
+The action forwards the authenticated request's Authorization header only to
+Open WebUI's own `/api/v1/files/` endpoints. Open WebUI stores the bytes using
+its configured local or S3 provider and enforces the current user's file access
+permissions on later playback and download requests.
 
 ## UX
 
-- The player renders directly above the assistant message.
-- The primary controls are playback and a labeled `Download MP3` button.
-- It avoids attaching a binary Open WebUI file, so users never see the misleading `Content` / `Preview` modal.
-- The message text confirms that the controls are directly above it.
+- The message receives one native audio-file attachment.
+- The friendly filename identifies the voice, generation time, and unique suffix.
+- The native Preview tab provides playback.
+- The Content tab explains: “Select Preview to listen. To download the MP3,
+  click the filename above.”
+- Clicking the filename uses Open WebUI's authenticated download route.
 
 ## Deliberate limitations
 
-- The audio bytes are stored in chat history, so this is intentionally capped at 2.5 MB by default. It is a short-form narration option, not the long-audio default.
-- Content in the chat DOM is recoverable by anyone with access to that chat. This aligns with the approved low-sensitivity, publicly-shareable audio use case, but it is not a private-file delivery mechanism.
-- Open WebUI documents that sandboxed iframe downloads can be unreliable on iOS. This variation is designed to be compared with the native-file action, whose title/download route remains the better fallback for that environment.
+- The audio bytes are stored by Open WebUI's configured file provider rather than
+  in chat history, so hour-long episodes do not inflate message records.
+- The small explanatory note is intentionally stored as file content so the
+  native Content tab is useful instead of showing “No content.”
+- File retention follows Open WebUI's configured storage and cleanup policy.
 
 ## Source basis
 
-This implementation follows Open WebUI's current Event and Rich UI Embedding documentation: short-name `embeds` events persist to the database; action embeds render above message text; embeds support scripts and downloads; and embeds should report height with `iframe:height`. The documentation also confirms the authentication and sandbox constraints that make a relative protected file URL unsuitable here.
-
-The canonical action emits one persistent `embeds` player. Infrastructure CSP
-permits `blob:` and `data:` frames, and the Open WebUI iframe sandbox defaults
-allow same-origin access and downloads, so the player and download control stay
-together in one card.
+This implementation follows Open WebUI's current Events and Files API
+documentation. Short-name `files` events persist file attachments on the
+message, while `/api/v1/files/{id}/content` provides authenticated playback and
+download. The action avoids `execute` and Rich UI iframe workarounds entirely.

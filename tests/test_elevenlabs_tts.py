@@ -18,18 +18,7 @@ def load_module():
 tts = load_module()
 
 
-def test_embed_is_self_contained_and_has_intentional_player_and_download_controls():
-    rendered = tts.embed_html(b"ID3audio", "episode.mp3", "Ada <Friendly>")
-    assert "SUQzYXVkaW8=" in rendered
-    assert 'id="player" controls' in rendered
-    assert 'id="download"' in rendered
-    assert "Download MP3" in rendered
-    assert "Ada &lt;Friendly&gt;" in rendered
-    assert "/api/v1/files/" not in rendered
-    assert "iframe:height" in rendered
-
-
-def test_embed_message_preserves_assistant_answer_and_describes_controls():
+def test_file_message_preserves_assistant_answer_and_describes_controls():
     result = tts.message_result(
         {
             "id": "message-1",
@@ -44,7 +33,7 @@ def test_embed_message_preserves_assistant_answer_and_describes_controls():
         "messages": [
             {
                 "id": "message-1",
-                "content": "Original answer.\n\nAudio ready with **Donovan**. Use the player and **Download MP3** button in the audio card.",
+                "content": "Original answer.\n\nAudio ready with **Donovan**. Open the attached audio file to preview or download it.",
             }
         ]
     }
@@ -54,14 +43,32 @@ def test_markup_is_cleaned_before_narration():
     assert tts.speech_text("# Hello\n[guide](https://example.com)\n`thanks`") == "Hello guide thanks"
 
 
+def test_voice_filename_part_is_safe_and_friendly():
+    assert tts.filename_voice_part("Ada / Friendly") == "Ada-Friendly"
+    assert tts.filename_voice_part("...") == "voice"
+
+
 @pytest.mark.asyncio
-async def test_action_emits_one_persistent_iframe_player(monkeypatch):
+async def test_action_attaches_one_native_audio_file(monkeypatch):
     action = tts.Action()
     action.valves.ELEVENLABS_API_KEY = "test-key"
-    action.valves.MAX_EMBED_AUDIO_BYTES = 100_000
     monkeypatch.setattr(action, "voice_options", lambda: async_value(({"Ada": "voice-id"}, {}))
     )
     monkeypatch.setattr(action, "generate_audio", lambda voice_id, text: async_value(b"ID3audio"))
+    monkeypatch.setattr(
+        tts,
+        "upload_audio_file",
+        lambda audio, filename, voice_name, user, request: async_value(
+            {
+                "id": "file-1",
+                "type": "file",
+                "url": "file-1",
+                "name": filename,
+                "size": len(audio),
+                "content_type": "audio/mpeg",
+            }
+        ),
+    )
     events = []
 
     async def emit(event):
@@ -80,30 +87,34 @@ async def test_action_emits_one_persistent_iframe_player(monkeypatch):
         __event_call__=choose_voice,
     )
 
-    embed_event = next(event for event in events if event["type"] == "embeds")
-    assert embed_event["data"]["replace"] is True
-    assert len(embed_event["data"]["embeds"]) == 1
-    assert "Download MP3" in embed_event["data"]["embeds"][0]
+    file_event = next(event for event in events if event["type"] == "files")
+    assert file_event["data"]["files"][0]["id"] == "file-1"
+    assert file_event["data"]["files"][0]["content_type"] == "audio/mpeg"
+    assert not any(event["type"] == "embeds" for event in events)
     assert not any(event["type"] == "execute" for event in events)
     assert result["messages"][0]["id"] == "message-1"
 
 
 @pytest.mark.asyncio
-async def test_action_rejects_audio_that_would_bloat_chat_history(monkeypatch):
+async def test_action_allows_large_audio_when_file_storage_succeeds(monkeypatch):
     action = tts.Action()
     action.valves.ELEVENLABS_API_KEY = "test-key"
-    action.valves.MAX_EMBED_AUDIO_BYTES = 100_000
     monkeypatch.setattr(action, "voice_options", lambda: async_value(({"Ada": "voice-id"}, {}))
     )
     monkeypatch.setattr(
         action, "generate_audio", lambda voice_id, text: async_value(b"x" * 100_001)
+    )
+    monkeypatch.setattr(
+        tts,
+        "upload_audio_file",
+        lambda audio, filename, voice_name, user, request: async_value({"id": "large-file", "type": "file", "url": "large-file", "name": filename, "size": len(audio), "content_type": "audio/mpeg"}),
     )
 
     result = await action.action(
         {"messages": [{"role": "assistant", "content": "A short answer."}]},
         __event_call__=lambda event: async_value("Ada"),
     )
-    assert "embedded-player limit" in result["content"]
+    assert result["content"].endswith("Open the attached audio file to preview or download it.")
 
 
 async def async_value(value):

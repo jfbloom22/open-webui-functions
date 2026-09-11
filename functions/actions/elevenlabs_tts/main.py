@@ -1,27 +1,27 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 1.0.0
+version: 1.1.0
 license: MIT
 requirements: aiohttp, pydantic
-description: Generate speech in a self-contained, persistent player with an explicit MP3 download button.
+description: Generate speech and attach a native Open WebUI audio file with preview and download support.
 """
 
-"""A function-only alternative to Open WebUI's native file attachment UI.
+"""Generate audio and attach it through Open WebUI's native Files system.
 
-The audio is embedded as base64 inside Open WebUI's documented ``embeds`` event.
-That makes the player and download control independent of the browser's authenticated
-``/api/v1/files/...`` navigation behaviour. The trade-off is intentionally bounded by
-MAX_EMBED_AUDIO_BYTES: embed payloads live in chat history, so this is for short-form
-narration rather than long podcasts.
+The MP3 is stored in Open WebUI's configured storage provider, not in the chat
+message body. The message receives a normal file attachment, so Open WebUI's
+native audio preview and authenticated download route handle files of any
+reasonable podcast length.
 """
 
 import asyncio
-import base64
 import html
+import json
 import random
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 
 import aiohttp
@@ -84,58 +84,71 @@ def model_for_mode(mode: str) -> str:
     return FAST_MODEL if mode.strip().casefold() == "fast" else QUALITY_MODEL
 
 
-def embed_html(audio: bytes, filename: str, voice_name: str) -> str:
-    """Build a self-contained player that does not need Open WebUI auth in its iframe.
+def filename_voice_part(voice_name: str) -> str:
+    """Keep the friendly filename safe for storage and downloads."""
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", voice_name).strip(".-")
+    return value or "voice"
 
-    An object URL is created inside the sandboxed iframe from the base64 payload. This
-    avoids an iframe request to Open WebUI's protected Files endpoint, which cannot
-    access the parent page's localStorage token by default.
-    """
-    encoded = base64.b64encode(audio).decode("ascii")
-    safe_filename = html.escape(filename, quote=True)
-    safe_voice = html.escape(voice_name)
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    :root {{ color-scheme: light dark; }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; padding: 12px; font-family: ui-sans-serif, system-ui, sans-serif; }}
-    .card {{ border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 12px; padding: 14px; }}
-    .title {{ font-weight: 700; margin: 0 0 3px; }}
-    .meta {{ margin: 0 0 12px; opacity: .72; font-size: .88rem; }}
-    audio {{ display: block; width: 100%; margin-bottom: 12px; }}
-    .download {{ display: inline-block; padding: 8px 12px; border-radius: 8px; background: #2563eb; color: white; font-weight: 650; text-decoration: none; }}
-    .hint {{ margin: 9px 0 0; opacity: .68; font-size: .78rem; }}
-  </style>
-</head>
-<body>
-  <section class="card" aria-label="Generated ElevenLabs audio">
-    <p class="title">Audio ready</p>
-    <p class="meta">Voice: {safe_voice} · MP3</p>
-    <audio id="player" controls preload="metadata">Your browser does not support audio playback.</audio>
-    <a id="download" class="download" download="{safe_filename}" href="#">Download MP3</a>
-    <p class="hint">Preview above, then use Download MP3 to save a copy.</p>
-  </section>
-  <script>
-    (() => {{
-      const base64Audio = '{encoded}';
-      const binary = atob(base64Audio);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-      const url = URL.createObjectURL(new Blob([bytes], {{ type: 'audio/mpeg' }}));
-      document.getElementById('player').src = url;
-      document.getElementById('download').href = url;
-      const reportHeight = () => parent.postMessage({{ type: 'iframe:height', height: document.documentElement.scrollHeight }}, '*');
-      window.addEventListener('load', reportHeight);
-      new ResizeObserver(reportHeight).observe(document.body);
-      window.addEventListener('beforeunload', () => URL.revokeObjectURL(url));
-    }})();
-  </script>
-</body>
-</html>"""
+
+async def upload_audio_file(
+    audio: bytes,
+    filename: str,
+    voice_name: str,
+    user: dict,
+    request: Any,
+) -> dict[str, Any]:
+    """Store audio in Open WebUI's configured file storage and return its file card data."""
+    user_id = user.get("id") if isinstance(user, dict) else None
+    authorization = request.headers.get("Authorization") if request else None
+    if not user_id or not authorization or not request:
+        raise ValueError("Open WebUI file storage requires an authenticated request.")
+
+    form = aiohttp.FormData()
+    form.add_field("file", audio, filename=filename, content_type="audio/mpeg")
+    form.add_field(
+        "metadata",
+        json.dumps({"name": filename, "content_type": "audio/mpeg", "size": len(audio)}),
+    )
+    origin = request.headers.get("Origin")
+    if origin == "null":
+        origin = None
+    base_url = (origin or str(request.base_url)).rstrip("/")
+    headers = {"Authorization": authorization}
+    timeout = aiohttp.ClientTimeout(total=max(120, 2 * 90))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            f"{base_url}/api/v1/files/?process=false&process_in_background=false",
+            data=form,
+            headers=headers,
+        ) as response:
+            if response.status >= 400:
+                raise ValueError(await Action.api_error(response, "save the audio file"))
+            file_record = await response.json()
+
+        file_id = file_record.get("id")
+        if not file_id:
+            raise ValueError("Open WebUI did not return an audio file ID.")
+
+        note = (
+            f"Audio ready with {voice_name}. Select Preview to listen. "
+            "To download the MP3, click the filename above."
+        )
+        async with session.post(
+            f"{base_url}/api/v1/files/{file_id}/data/content/update",
+            json={"content": note},
+            headers={**headers, "Content-Type": "application/json"},
+        ) as response:
+            if response.status >= 400:
+                raise ValueError(await Action.api_error(response, "add the audio download note"))
+
+    return {
+        "id": file_id,
+        "type": "file",
+        "url": file_id,
+        "name": filename,
+        "size": len(audio),
+        "content_type": "audio/mpeg",
+    }
 
 
 def message_result(body: dict, voice_name: str) -> dict[str, Any]:
@@ -148,7 +161,7 @@ def message_result(body: dict, voice_name: str) -> dict[str, Any]:
         ),
         "",
     ).rstrip()
-    notice = f"Audio ready with **{voice_name}**. Use the player and **Download MP3** button in the audio card."
+    notice = f"Audio ready with **{voice_name}**. Open the attached audio file to preview or download it."
     content = f"{current}\n\n{notice}" if current else notice
     if body.get("id"):
         return {"messages": [{"id": body["id"], "content": content}]}
@@ -168,12 +181,6 @@ class Action:
             description="One curated voice per line: Name:VoiceID:optional description.",
         )
         MAX_CHARACTERS: int = Field(default=2200, ge=100, le=10000)
-        MAX_EMBED_AUDIO_BYTES: int = Field(
-            default=2_500_000,
-            ge=100_000,
-            le=10_000_000,
-            description="Largest MP3 stored directly in chat history. Keep this small for responsive chats.",
-        )
         REQUEST_TIMEOUT_SECONDS: int = Field(default=90, ge=10, le=300)
         RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=4)
 
@@ -263,6 +270,7 @@ class Action:
         __user__: dict = {},
         __event_emitter__: Callable | None = None,
         __event_call__: Callable | None = None,
+        __request__: Any = None,
     ) -> dict[str, Any]:
         try:
             if not self.valves.ELEVENLABS_API_KEY.strip():
@@ -302,15 +310,13 @@ class Action:
             if __event_emitter__:
                 await __event_emitter__(self.status(f"Generating speech with {voice_name}"))
             audio = await self.generate_audio(voice_id, text)
-            if len(audio) > self.valves.MAX_EMBED_AUDIO_BYTES:
-                raise ValueError(
-                    f"This MP3 is {len(audio) / 1_000_000:.1f} MB, above this variant's {self.valves.MAX_EMBED_AUDIO_BYTES / 1_000_000:.1f} MB embedded-player limit. Try a shorter response or another audio action."
-                )
-            filename = f"tts_{uuid.uuid4()}.mp3"
+            filename = (
+                f"Podcast audio - {filename_voice_part(voice_name)} - "
+                f"{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M%S')} - {uuid.uuid4().hex[:8]}.mp3"
+            )
+            file_card = await upload_audio_file(audio, filename, voice_name, __user__, __request__)
             if __event_emitter__:
-                await __event_emitter__(
-                    {"type": "embeds", "data": {"embeds": [embed_html(audio, filename, voice_name)], "replace": True}}
-                )
+                await __event_emitter__({"type": "files", "data": {"files": [file_card]}})
                 await __event_emitter__(self.status("Audio ready", done=True))
             return message_result(body, voice_name)
         except ValueError as exc:
