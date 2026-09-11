@@ -55,7 +55,7 @@ def test_markup_is_cleaned_before_narration():
 
 
 @pytest.mark.asyncio
-async def test_action_keeps_iframe_and_emits_main_page_fallback(monkeypatch):
+async def test_action_emits_one_persistent_iframe_player(monkeypatch):
     action = tts.Action()
     action.valves.ELEVENLABS_API_KEY = "test-key"
     action.valves.MAX_EMBED_AUDIO_BYTES = 100_000
@@ -84,9 +84,7 @@ async def test_action_keeps_iframe_and_emits_main_page_fallback(monkeypatch):
     assert embed_event["data"]["replace"] is True
     assert len(embed_event["data"]["embeds"]) == 1
     assert "Download MP3" in embed_event["data"]["embeds"][0]
-    execute_event = next(event for event in events if event["type"] == "execute")
-    assert "Download MP3" in execute_event["data"]["code"]
-    assert "createElement('audio')" in execute_event["data"]["code"]
+    assert not any(event["type"] == "execute" for event in events)
     assert result["messages"][0]["id"] == "message-1"
 
 

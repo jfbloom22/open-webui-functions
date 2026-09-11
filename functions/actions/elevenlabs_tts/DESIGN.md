@@ -27,8 +27,7 @@ Open WebUI's file route relies on an Authorization header from the parent app's 
 
 This implementation follows Open WebUI's current Event and Rich UI Embedding documentation: short-name `embeds` events persist to the database; action embeds render above message text; embeds support scripts and downloads; and embeds should report height with `iframe:height`. The documentation also confirms the authentication and sandbox constraints that make a relative protected file URL unsuitable here.
 
-The current version keeps the iframe as the primary player and also emits a
-main-page `execute` fallback. Infrastructure CSP now permits `blob:` and
-`data:` frames, which Safari requires for the iframe. If a browser still blocks
-the sandboxed download, the main-page card supplies a second working player
-and download control.
+The canonical action emits one persistent `embeds` player. Infrastructure CSP
+permits `blob:` and `data:` frames, and the Open WebUI iframe sandbox defaults
+allow same-origin access and downloads, so the player and download control stay
+together in one card.
