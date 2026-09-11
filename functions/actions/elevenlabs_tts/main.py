@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 0.3.2
+version: 0.3.3
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
@@ -80,12 +80,18 @@ def model_for_mode(mode: str) -> str:
     return FAST_MODEL if mode.strip().lower() == "fast" else QUALITY_MODEL
 
 
+def file_content_url(file_id: str, *, attachment: bool = False) -> str:
+    """Return Open WebUI's authenticated file-content route for a stored file."""
+    suffix = "?attachment=true" if attachment else ""
+    return f"/api/v1/files/{file_id}/content{suffix}"
+
+
 def file_attachment(file_id: str, filename: str, size: int) -> dict[str, Any]:
-    """Shape a generated file for Open WebUI's downloadable message attachment UI."""
+    """Shape a generated file for Open WebUI's native file event."""
     return {
         "type": "file",
         "id": file_id,
-        "url": file_id,
+        "url": file_content_url(file_id, attachment=True),
         "name": filename,
         "content_type": "audio/mpeg",
         "size": size,
@@ -311,7 +317,10 @@ class Action:
                 )
                 await __event_emitter__(self.status("Audio generated", done=True))
             return {
-                "content": f"Audio generated with ElevenLabs voice **{voice_name}**. The MP3 is attached to this message."
+                "content": (
+                    f"Audio generated with ElevenLabs voice **{voice_name}**. "
+                    f"[Download the MP3]({file_content_url(file_id, attachment=True)})"
+                )
             }
         except ValueError as exc:
             message = str(exc)

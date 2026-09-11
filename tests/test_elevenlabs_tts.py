@@ -86,11 +86,19 @@ def test_file_attachment_uses_openwebui_downloadable_message_shape():
     assert attachment == {
         "type": "file",
         "id": "file-1",
-        "url": "file-1",
+        "url": "/api/v1/files/file-1/content?attachment=true",
         "name": "tts.mp3",
         "content_type": "audio/mpeg",
         "size": 1234,
     }
+
+
+def test_file_content_url_uses_openwebui_authenticated_route():
+    assert tts.file_content_url("file-1") == "/api/v1/files/file-1/content"
+    assert (
+        tts.file_content_url("file-1", attachment=True)
+        == "/api/v1/files/file-1/content?attachment=true"
+    )
 
 
 @pytest.mark.asyncio
