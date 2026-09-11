@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 0.3.3
+version: 0.3.4
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
@@ -317,10 +317,7 @@ class Action:
                 )
                 await __event_emitter__(self.status("Audio generated", done=True))
             return {
-                "content": (
-                    f"Audio generated with ElevenLabs voice **{voice_name}**. "
-                    f"[Download the MP3]({file_content_url(file_id, attachment=True)})"
-                )
+                "content": f"Audio generated with ElevenLabs voice **{voice_name}**. The MP3 is attached to this message."
             }
         except ValueError as exc:
             message = str(exc)
