@@ -130,6 +130,7 @@ async def test_create_file_uses_current_async_openwebui_file_api(monkeypatch):
         async def insert_new_file(user_id, form):
             assert user_id == "user-1"
             assert form["meta"]["content_type"] == "audio/mpeg"
+            assert form["data"]["content"].startswith("Generated audio.")
             return SimpleNamespace(id=form["id"])
 
     monkeypatch.setattr(tts, "Files", Files)

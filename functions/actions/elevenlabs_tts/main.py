@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 0.3.5
+version: 0.3.6
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
@@ -368,6 +368,12 @@ class Action:
                         "id": file_id,
                         "filename": filename,
                         "path": path,
+                        "data": {
+                            "content": (
+                                "Generated audio. Use the Preview tab to listen, "
+                                "or click the filename to download the MP3."
+                            )
+                        },
                         "meta": {
                             "name": filename,
                             "content_type": "audio/mpeg",
