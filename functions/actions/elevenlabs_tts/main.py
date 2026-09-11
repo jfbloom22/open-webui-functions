@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 1.2.0
+version: 1.3.0
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate speech and attach a native Open WebUI audio file with preview and download support.
@@ -268,13 +268,17 @@ class Action:
                 pass
         return random.uniform(0, min(8.0, 0.5 * (2**attempt)))
 
-    async def generate_audio(self, voice_id: str, text: str) -> bytes:
+    async def generate_audio(
+        self, voice_id: str, text: str, previous_request_ids: list[str] | None = None
+    ) -> tuple[bytes, str | None]:
         headers = {"xi-api-key": self.valves.ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload = {
             "text": text,
             "model_id": self.selected_model(),
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
         }
+        if previous_request_ids:
+            payload["previous_request_ids"] = previous_request_ids[-3:]
         timeout = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
         for attempt in range(self.valves.RETRY_ATTEMPTS + 1):
             try:
@@ -286,7 +290,7 @@ class Action:
                         headers=headers,
                     ) as response:
                         if response.status < 400:
-                            return await response.read()
+                            return await response.read(), response.headers.get("request-id")
                         error = await self.api_error(response, "generate speech")
                         retryable = response.status == 429 or response.status >= 500
                         retry_after = response.headers.get("Retry-After")
@@ -345,11 +349,19 @@ class Action:
                 raise ValueError("Voice selection was cancelled or does not match a curated voice.")
             voice_name, voice_id = resolved
             audio_parts: list[bytes] = []
+            request_ids: list[str] = []
             for index, text_chunk in enumerate(text_chunks, start=1):
                 if __event_emitter__:
                     suffix = f" ({index}/{len(text_chunks)})" if len(text_chunks) > 1 else ""
                     await __event_emitter__(self.status(f"Generating speech with {voice_name}{suffix}"))
-                audio_parts.append(await self.generate_audio(voice_id, text_chunk))
+                generated = await self.generate_audio(voice_id, text_chunk, request_ids)
+                if isinstance(generated, tuple):
+                    audio_part, request_id = generated
+                else:  # Keep compatibility with simple test doubles and older runners.
+                    audio_part, request_id = generated, None
+                audio_parts.append(audio_part)
+                if request_id:
+                    request_ids.append(request_id)
             audio = b"".join(audio_parts)
             filename = (
                 f"Podcast audio - {filename_voice_part(voice_name)} - "

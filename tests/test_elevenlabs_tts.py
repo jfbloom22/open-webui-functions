@@ -59,7 +59,7 @@ async def test_action_attaches_one_native_audio_file(monkeypatch):
     action.valves.ELEVENLABS_API_KEY = "test-key"
     monkeypatch.setattr(action, "voice_options", lambda: async_value(({"Ada": "voice-id"}, {}))
     )
-    monkeypatch.setattr(action, "generate_audio", lambda voice_id, text: async_value(b"ID3audio"))
+    monkeypatch.setattr(action, "generate_audio", lambda *args: async_value(b"ID3audio"))
     monkeypatch.setattr(
         tts,
         "upload_audio_file",
@@ -107,7 +107,7 @@ async def test_action_allows_large_audio_when_file_storage_succeeds(monkeypatch)
     monkeypatch.setattr(action, "voice_options", lambda: async_value(({"Ada": "voice-id"}, {}))
     )
     monkeypatch.setattr(
-        action, "generate_audio", lambda voice_id, text: async_value(b"x" * 100_001)
+        action, "generate_audio", lambda *args: async_value(b"x" * 100_001)
     )
     monkeypatch.setattr(
         tts,
