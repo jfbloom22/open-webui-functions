@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS
 author: Workplace Labs
-version: 0.3.4
+version: 0.3.5
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate private, downloadable speech from the latest assistant reply with curated ElevenLabs voices.
@@ -95,6 +95,32 @@ def file_attachment(file_id: str, filename: str, size: int) -> dict[str, Any]:
         "name": filename,
         "content_type": "audio/mpeg",
         "size": size,
+    }
+
+
+def message_with_download_link(body: dict, voice_name: str, file_id: str) -> dict[str, Any]:
+    """Update the action message with a visible, authenticated download link."""
+    messages = body.get("messages", [])
+    current = next(
+        (
+            message.get("content", "")
+            for message in reversed(messages)
+            if message.get("role") == "assistant"
+        ),
+        "",
+    )
+    link = f"[Download audio]({file_content_url(file_id, attachment=True)})"
+    content = current.rstrip()
+    if link not in content:
+        content = f"{content}\n\n{link}" if content else link
+    message_id = body.get("id")
+    if message_id:
+        return {"messages": [{"id": message_id, "content": content}]}
+    return {
+        "content": (
+            f"Audio generated with ElevenLabs voice **{voice_name}**. "
+            f"{link}"
+        )
     }
 
 
@@ -309,16 +335,14 @@ class Action:
             if __event_emitter__:
                 await __event_emitter__(
                     {
-                        "type": "chat:message:files",
+                        "type": "files",
                         "data": {
                             "files": [file_attachment(file_id, filename, len(audio))]
                         },
                     }
                 )
                 await __event_emitter__(self.status("Audio generated", done=True))
-            return {
-                "content": f"Audio generated with ElevenLabs voice **{voice_name}**. The MP3 is attached to this message."
-            }
+            return message_with_download_link(body, voice_name, file_id)
         except ValueError as exc:
             message = str(exc)
         except Exception:

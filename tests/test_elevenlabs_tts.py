@@ -101,6 +101,28 @@ def test_file_content_url_uses_openwebui_authenticated_route():
     )
 
 
+def test_message_result_adds_a_visible_download_link_without_overwriting_content():
+    result = tts.message_with_download_link(
+        {
+            "id": "message-1",
+            "messages": [
+                {"role": "user", "content": "Read this aloud"},
+                {"role": "assistant", "content": "Here is the response."},
+            ],
+        },
+        "Donovan",
+        "file-1",
+    )
+    assert result == {
+        "messages": [
+            {
+                "id": "message-1",
+                "content": "Here is the response.\n\n[Download audio](/api/v1/files/file-1/content?attachment=true)",
+            }
+        ]
+    }
+
+
 @pytest.mark.asyncio
 async def test_create_file_uses_current_async_openwebui_file_api(monkeypatch):
     class Files:
