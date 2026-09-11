@@ -27,6 +27,8 @@ Open WebUI's file route relies on an Authorization header from the parent app's 
 
 This implementation follows Open WebUI's current Event and Rich UI Embedding documentation: short-name `embeds` events persist to the database; action embeds render above message text; embeds support scripts and downloads; and embeds should report height with `iframe:height`. The documentation also confirms the authentication and sandbox constraints that make a relative protected file URL unsuitable here.
 
-The current version also emits a main-page `execute` event that creates a visible
-Download MP3 control outside the sandbox. This addresses browsers that render
-the embedded player but block its iframe-initiated download.
+The current version no longer emits an `embeds` event. Safari renders Open
+WebUI embeds as sandboxed `blob:null` frames, which can fail CSP and
+same-origin checks. Instead, the action emits one main-page `execute` event
+that creates both the player and Download MP3 control in the trusted page
+context. This retains the embedded-player UX without the iframe boundary.

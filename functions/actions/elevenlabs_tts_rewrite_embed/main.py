@@ -1,7 +1,7 @@
 """
 title: ElevenLabs TTS, Embedded Player
 author: Workplace Labs
-version: 1.1.0
+version: 1.2.0
 license: MIT
 requirements: aiohttp, pydantic
 description: Generate speech in a self-contained, persistent player with an explicit MP3 download button.
@@ -140,21 +140,24 @@ def embed_html(audio: bytes, filename: str, voice_name: str) -> str:
 
 
 def download_panel_script(audio: bytes, filename: str, voice_name: str) -> str:
-    """Build the same download control in the trusted main page, not the iframe."""
+    """Build a player and download control in the trusted main page, not an iframe."""
     encoded = base64.b64encode(audio).decode("ascii")
     return f"""(() => {{
       const existing = document.getElementById('wl-tts-download-panel'); if (existing) existing.remove();
       const data = {json.dumps(encoded)}; const filename = {json.dumps(filename)};
       const panel = document.createElement('div'); panel.id = 'wl-tts-download-panel';
-      panel.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483647;background:#171717;color:#fff;border:1px solid #555;border-radius:12px;padding:14px 16px;box-shadow:0 8px 30px #0008;font:14px system-ui,sans-serif;display:flex;align-items:center;gap:12px';
-      const text = document.createElement('span'); text.textContent = 'Audio ready (' + {json.dumps(voice_name)} + ')';
+      panel.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483647;background:#171717;color:#fff;border:1px solid #555;border-radius:12px;padding:14px 16px;box-shadow:0 8px 30px #0008;font:14px system-ui,sans-serif;width:min(420px,calc(100vw - 40px))';
+      const heading = document.createElement('div'); heading.textContent = 'Audio ready (' + {json.dumps(voice_name)} + ')'; heading.style.cssText = 'font-weight:700;margin-bottom:10px';
+      const binary = atob(data); const bytes = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], {{type:'audio/mpeg'}}));
+      const player = document.createElement('audio'); player.controls = true; player.preload = 'metadata'; player.src = url; player.style.cssText = 'display:block;width:100%;margin-bottom:10px';
       const button = document.createElement('button'); button.textContent = 'Download MP3';
       button.style.cssText = 'border:0;border-radius:8px;padding:8px 12px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer';
-      button.onclick = () => {{ const binary = atob(data); const bytes = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        const url = URL.createObjectURL(new Blob([bytes], {{type:'audio/mpeg'}})); const link = document.createElement('a'); link.href = url; link.download = filename;
+      button.onclick = () => {{ const link = document.createElement('a'); link.href = url; link.download = filename;
         document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); }};
       const close = document.createElement('button'); close.textContent = '×'; close.setAttribute('aria-label', 'Close'); close.style.cssText = 'border:0;background:transparent;color:#aaa;font-size:20px;cursor:pointer'; close.onclick = () => panel.remove();
-      panel.append(text, button, close); document.body.appendChild(panel);
+      panel.append(heading, player, button, close); document.body.appendChild(panel);
+      window.addEventListener('beforeunload', () => URL.revokeObjectURL(url), {{once:true}});
     }})()"""
 
 
@@ -168,7 +171,7 @@ def message_result(body: dict, voice_name: str) -> dict[str, Any]:
         ),
         "",
     ).rstrip()
-    notice = f"Audio ready with **{voice_name}**. Use the player and **Download MP3** button above."
+    notice = f"Audio ready with **{voice_name}**. Use the player and **Download MP3** button in the audio card."
     content = f"{current}\n\n{notice}" if current else notice
     if body.get("id"):
         return {"messages": [{"id": body["id"], "content": content}]}
@@ -328,9 +331,8 @@ class Action:
                 )
             filename = f"tts_{uuid.uuid4()}.mp3"
             if __event_emitter__:
-                await __event_emitter__(
-                    {"type": "embeds", "data": {"embeds": [embed_html(audio, filename, voice_name)], "replace": True}}
-                )
+                # Safari rejects Open WebUI's sandboxed blob:null iframe under CSP.
+                # Render the player in the trusted main page instead.
                 await __event_emitter__({"type": "execute", "data": {"code": download_panel_script(audio, filename, voice_name)}})
                 await __event_emitter__(self.status("Audio ready", done=True))
             return message_result(body, voice_name)

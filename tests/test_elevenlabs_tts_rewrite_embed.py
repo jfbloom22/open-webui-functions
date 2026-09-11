@@ -44,7 +44,7 @@ def test_embed_message_preserves_assistant_answer_and_describes_controls():
         "messages": [
             {
                 "id": "message-1",
-                "content": "Original answer.\n\nAudio ready with **Donovan**. Use the player and **Download MP3** button above.",
+                "content": "Original answer.\n\nAudio ready with **Donovan**. Use the player and **Download MP3** button in the audio card.",
             }
         ]
     }
@@ -55,7 +55,7 @@ def test_markup_is_cleaned_before_narration():
 
 
 @pytest.mark.asyncio
-async def test_action_persists_a_single_embed_and_does_not_create_a_file(monkeypatch):
+async def test_action_uses_main_page_player_and_does_not_emit_sandboxed_embed(monkeypatch):
     action = tts.Action()
     action.valves.ELEVENLABS_API_KEY = "test-key"
     action.valves.MAX_EMBED_AUDIO_BYTES = 100_000
@@ -80,10 +80,11 @@ async def test_action_persists_a_single_embed_and_does_not_create_a_file(monkeyp
         __event_call__=choose_voice,
     )
 
-    embed_event = next(event for event in events if event["type"] == "embeds")
-    assert embed_event["data"]["replace"] is True
-    assert len(embed_event["data"]["embeds"]) == 1
-    assert "Download MP3" in embed_event["data"]["embeds"][0]
+    assert not any(event["type"] == "embeds" for event in events)
+    execute_event = next(event for event in events if event["type"] == "execute")
+    assert "Download MP3" in execute_event["data"]["code"]
+    assert "<audio" not in execute_event["data"]["code"]
+    assert "createElement('audio')" in execute_event["data"]["code"]
     assert result["messages"][0]["id"] == "message-1"
 
 
